@@ -1,0 +1,44 @@
+---
+services:
+  memory-mcp-ce:
+    build: .
+    #image: ghcr.io/symbiomind/memory-mcp-ce:latest
+    container_name: memory-mcp-ce
+    ports:
+      - 5005:5005
+    restart: unless-stopped
+    env_file: .env
+    networks:
+      - mcp-ce-shared
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: memory-postgres
+    env_file: .env
+    restart: unless-stopped
+    # set shared memory limit when using docker-compose
+    shm_size: 128mb
+    volumes:
+    # set shared memory for docker swarm
+    #  - type: tmpfs
+    #    target: /dev/shm
+    #    tmpfs:
+    #      size: 134217728 # 128*2^20 bytes = 128Mb
+      - ./data/postgresql:/var/lib/postgresql/data
+    networks:
+      - mcp-ce-shared
+
+  ollama:
+    image: ollama/ollama:0.13.4
+    container_name: memory-ollama
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - ./data/ollama:/models
+    networks:
+      - mcp-ce-shared
+
+networks:
+  mcp-ce-shared:
+    name: mcp-ce-shared
+    driver: bridge
