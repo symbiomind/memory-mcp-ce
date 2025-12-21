@@ -45,3 +45,10 @@ OAUTH_ACCESS_TOKEN_EXPIRY = int(os.getenv("OAUTH_ACCESS_TOKEN_EXPIRY", 3600))
 OAUTH_REFRESH_TOKEN_EXPIRY = int(os.getenv("OAUTH_REFRESH_TOKEN_EXPIRY", 604800))
 # Authorization codes - default 5 minutes (300 seconds)
 OAUTH_AUTH_CODE_EXPIRY = int(os.getenv("OAUTH_AUTH_CODE_EXPIRY", 300))
+
+# OAuth Redirect URIs (comma-separated list of exact URIs per MCP spec)
+# Default includes Claude.ai and localhost for backward compatibility
+OAUTH_REDIRECT_URIS = os.getenv(
+    "OAUTH_REDIRECT_URIS",
+    "https://claude.ai/api/mcp/auth_callback,http://localhost/callback,http://127.0.0.1/callback"
+)

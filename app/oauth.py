@@ -35,6 +35,7 @@ from app.config import (
     OAUTH_ACCESS_TOKEN_EXPIRY,
     OAUTH_REFRESH_TOKEN_EXPIRY,
     OAUTH_AUTH_CODE_EXPIRY,
+    OAUTH_REDIRECT_URIS,
 )
 
 logger = logging.getLogger(__name__)
@@ -80,16 +81,17 @@ class MemoryOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
     
     def _register_default_client(self) -> None:
         """Pre-register default OAuth client for Claude Desktop compatibility."""
-        from pydantic import AnyUrl
+        # Parse redirect URIs from config (comma-separated list)
+        redirect_uris = [
+            AnyUrl(uri.strip())
+            for uri in OAUTH_REDIRECT_URIS.split(",")
+            if uri.strip()
+        ]
         
         default_client = OAuthClientInformationFull(
             client_id=OAUTH_CLIENT_ID,
             client_secret=OAUTH_CLIENT_SECRET if OAUTH_CLIENT_SECRET else None,
-            redirect_uris=[
-                AnyUrl("https://claude.ai/api/mcp/auth_callback"),
-                AnyUrl("http://localhost/callback"),
-                AnyUrl("http://127.0.0.1/callback"),
-            ],
+            redirect_uris=redirect_uris,
             client_name="Memory MCP-CE Default Client",
             grant_types=["authorization_code", "refresh_token"],
             response_types=["code"],
@@ -99,6 +101,7 @@ class MemoryOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         
         self.clients[OAUTH_CLIENT_ID] = default_client
         logger.info(f"✅ Pre-registered default OAuth client: {OAUTH_CLIENT_ID} with scope: mcp")
+        logger.info(f"   Allowed redirect URIs: {[str(uri) for uri in redirect_uris]}")
     
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         """Get OAuth client information by client ID."""
