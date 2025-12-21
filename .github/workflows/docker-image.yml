@@ -4,6 +4,11 @@ on:
   push:
     branches:
       - main
+    paths:
+      - 'app/**'
+      - 'Dockerfile'
+      - 'requirements.txt'
+      - '.github/workflows/**'
   release:
     types: [published]
 
