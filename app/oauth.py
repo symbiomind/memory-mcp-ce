@@ -16,6 +16,8 @@ from pydantic import AnyUrl
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
+from app.templates import render_template
+
 from mcp.server.auth.provider import (
     AccessToken,
     AuthorizationCode,
@@ -174,122 +176,12 @@ class MemoryOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
                 status_code=400
             )
         
-        html_content = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Memory MCP-CE - Login</title>
-            <style>
-                body {{
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                    max-width: 400px;
-                    margin: 50px auto;
-                    padding: 20px;
-                    background: #f5f5f5;
-                    color: #333;
-                }}
-                .container {{
-                    background: white;
-                    padding: 30px;
-                    border-radius: 8px;
-                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-                }}
-                h2 {{
-                    margin-top: 0;
-                    color: #333;
-                }}
-                .form-group {{
-                    margin-bottom: 15px;
-                }}
-                label {{
-                    display: block;
-                    margin-bottom: 5px;
-                    font-weight: 500;
-                    color: #555;
-                }}
-                input {{
-                    width: 100%;
-                    padding: 10px;
-                    border: 1px solid #ddd;
-                    border-radius: 4px;
-                    font-size: 14px;
-                    box-sizing: border-box;
-                    background: #fff;
-                    color: #333;
-                }}
-                input:focus {{
-                    outline: none;
-                    border-color: #4CAF50;
-                }}
-                button {{
-                    width: 100%;
-                    padding: 12px;
-                    background: #4CAF50;
-                    color: white;
-                    border: none;
-                    border-radius: 4px;
-                    font-size: 16px;
-                    cursor: pointer;
-                    margin-top: 10px;
-                }}
-                button:hover {{
-                    background: #45a049;
-                }}
-                .error {{
-                    color: #e74c3c;
-                    background: #fadbd8;
-                    padding: 10px;
-                    border-radius: 4px;
-                    margin-bottom: 15px;
-                }}
-                
-                /* Dark Mode */
-                @media (prefers-color-scheme: dark) {{
-                    body {{
-                        background: #121212;
-                        color: #e0e0e0;
-                    }}
-                    .container {{
-                        background: #1e1e1e;
-                        box-shadow: 0 2px 10px rgba(0,0,0,0.5);
-                    }}
-                    h2, label {{
-                        color: #e0e0e0;
-                    }}
-                    input {{
-                        background: #333;
-                        color: #e0e0e0;
-                        border-color: #555;
-                    }}
-                    input:focus {{
-                        border-color: #4CAF50;
-                    }}
-                    .error {{
-                        background: #5c2b2b;
-                        color: #f5c6cb;
-                    }}
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h2>🔐 Memory MCP-CE Login</h2>
-                <form action="{self.server_url}/login/callback" method="post">
-                    <input type="hidden" name="state" value="{state}">
-                    <div class="form-group">
-                        <label for="username">Username</label>
-                        <input type="text" id="username" name="username" required autofocus>
-                    </div>
-                    <div class="form-group">
-                        <label for="password">Password</label>
-                        <input type="password" id="password" name="password" required>
-                    </div>
-                    <button type="submit">Sign In</button>
-                </form>
-            </div>
-        </body>
-        </html>
-        """
+        html_content = render_template(
+            "oauth.html",
+            state="login",
+            form_action=f"{self.server_url}/login/callback",
+            csrf_state=state,
+        )
         return HTMLResponse(content=html_content)
     
     async def handle_login_callback(self, request: Request) -> Response:
@@ -323,55 +215,14 @@ class MemoryOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         # Validate credentials
         if not self._authenticate_user(username, password):
             # Show login page again with error
-            html_content = f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>Memory MCP-CE - Login</title>
-                <style>
-                    body {{
-                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                        max-width: 400px;
-                        margin: 50px auto;
-                        padding: 20px;
-                        background: #f5f5f5;
-                    }}
-                    .container {{
-                        background: white;
-                        padding: 30px;
-                        border-radius: 8px;
-                        box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-                    }}
-                    h2 {{ margin-top: 0; color: #333; }}
-                    .form-group {{ margin-bottom: 15px; }}
-                    label {{ display: block; margin-bottom: 5px; font-weight: 500; color: #555; }}
-                    input {{ width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; box-sizing: border-box; }}
-                    input:focus {{ outline: none; border-color: #4CAF50; }}
-                    button {{ width: 100%; padding: 12px; background: #4CAF50; color: white; border: none; border-radius: 4px; font-size: 16px; cursor: pointer; margin-top: 10px; }}
-                    button:hover {{ background: #45a049; }}
-                    .error {{ color: #e74c3c; background: #fadbd8; padding: 10px; border-radius: 4px; margin-bottom: 15px; }}
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <h2>🔐 Memory MCP-CE Login</h2>
-                    <div class="error">❌ Invalid username or password</div>
-                    <form action="{self.server_url}/login/callback" method="post">
-                        <input type="hidden" name="state" value="{state}">
-                        <div class="form-group">
-                            <label for="username">Username</label>
-                            <input type="text" id="username" name="username" value="{username}" required>
-                        </div>
-                        <div class="form-group">
-                            <label for="password">Password</label>
-                            <input type="password" id="password" name="password" required>
-                        </div>
-                        <button type="submit">Sign In</button>
-                    </form>
-                </div>
-            </body>
-            </html>
-            """
+            html_content = render_template(
+                "oauth.html",
+                state="error",
+                error_message="Invalid username or password",
+                form_action=f"{self.server_url}/login/callback",
+                csrf_state=state,
+                username=username,
+            )
             return HTMLResponse(content=html_content, status_code=401)
         
         # Get state data
@@ -424,69 +275,11 @@ class MemoryOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         Returns:
             HTML response with success message and auto-close script
         """
-        html_content = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Memory MCP-CE - Authentication Successful</title>
-            <style>
-                body {{
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                    max-width: 400px;
-                    margin: 50px auto;
-                    padding: 20px;
-                    background: #f5f5f5;
-                    color: #333;
-                }}
-                .container {{
-                    background: white;
-                    padding: 30px;
-                    border-radius: 8px;
-                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-                    text-align: center;
-                }}
-                .success-icon {{
-                    font-size: 48px;
-                    margin-bottom: 15px;
-                }}
-                h2 {{
-                    margin-top: 0;
-                    color: #333;
-                }}
-                p {{
-                    color: #666;
-                    margin-bottom: 20px;
-                }}
-                
-                /* Dark Mode */
-                @media (prefers-color-scheme: dark) {{
-                    body {{
-                        background: #121212;
-                        color: #e0e0e0;
-                    }}
-                    .container {{
-                        background: #1e1e1e;
-                        box-shadow: 0 2px 10px rgba(0,0,0,0.5);
-                    }}
-                    h2, p {{
-                        color: #e0e_0e0;
-                    }}
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <div class="success-icon">✅</div>
-                <h2>Authentication Successful!</h2>
-                <p>You may now close this window.</p>
-            </div>
-            <script>
-                // Redirect to client callback immediately
-                window.location.href = "{redirect_url}";
-            </script>
-        </body>
-        </html>
-        """
+        html_content = render_template(
+            "oauth.html",
+            state="success",
+            redirect_url=redirect_url,
+        )
         return HTMLResponse(content=html_content)
     
     def _authenticate_user(self, username: str, password: str) -> bool:

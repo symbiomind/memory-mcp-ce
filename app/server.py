@@ -17,6 +17,8 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.exceptions import HTTPException
 
+from app.templates import init_templates, get_static_content
+
 from mcp.server.fastmcp import FastMCP
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 
@@ -167,6 +169,21 @@ def create_mcp_server() -> FastMCP:
             
             logger.info(f"📝 OAuth login routes registered: /login, /login/callback, /auth/success")
     
+    # Register static file route for CSS/JS (always available for OAuth pages)
+    @mcp.custom_route("/static/{path:path}", methods=["GET"])
+    async def serve_static(request: Request) -> Response:
+        """Serve static files (CSS, JS, images) for OAuth pages."""
+        path = request.path_params.get("path", "")
+        
+        result = get_static_content(path)
+        if result is None:
+            raise HTTPException(404, f"Static file not found: {path}")
+        
+        content, mime_type = result
+        return Response(content=content, media_type=mime_type)
+    
+    logger.info(f"📁 Static file route registered: /static/*")
+    
     # Register tools
     register_tools(mcp)
     
@@ -313,6 +330,9 @@ def register_tools(mcp: FastMCP) -> None:
 def main():
     """Main entry point for the server."""
     try:
+        # Initialize template system (for OAuth pages)
+        init_templates()
+        
         # Initialize database
         logger.info("🔍 Detecting embedding dimension...")
         embedding_dim = get_embedding_dimension()
