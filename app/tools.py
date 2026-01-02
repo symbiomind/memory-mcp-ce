@@ -1,8 +1,8 @@
 
-from app.database import get_db_connection, add_embedding_table_to_state, get_memory_embedding_tables
+from app.database import get_db_connection, add_embedding_to_state, get_memory_embedding_tables
 from app.embedding import get_embedding, get_embedding_dimension
 import psycopg2.extras
-from app.config import EMBEDDING_MODEL, NAMESPACE
+from app.config import EMBEDDING_MODEL, NAMESPACE, TIMEZONE, TIMEZONE_DISABLED
 from app.encryption import (
     encrypt_content,
     is_encryption_enabled,
@@ -16,6 +16,76 @@ from datetime import datetime, timezone
 
 # Get logger
 logger = logging.getLogger(__name__)
+
+
+def get_ordinal_suffix(day: int) -> str:
+    """
+    Get the ordinal suffix for a day number (st, nd, rd, th).
+    
+    Args:
+        day: Day of the month (1-31)
+    
+    Returns:
+        Ordinal suffix string
+    """
+    if 11 <= day <= 13:
+        return "th"
+    return {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+
+
+def format_current_time() -> tuple[str, str] | tuple[None, None]:
+    """
+    Format current time in human-readable format with timezone info.
+    
+    Returns:
+        Tuple of (formatted_time, timezone_string) or (None, None) if disabled
+    """
+    if TIMEZONE_DISABLED or TIMEZONE is None:
+        return None, None
+    
+    # Get current time in configured timezone
+    now = datetime.now(TIMEZONE)
+    
+    # Get timezone abbreviation (handles DST automatically)
+    tz_abbrev = now.strftime("%Z")
+    
+    # Get the timezone string from the environment (for the response)
+    import os
+    tz_string = os.getenv("TIMEZONE", "").strip()
+    if not tz_string or tz_string.lower() == "false":
+        tz_string = "UTC"
+    
+    # Format: "Friday, 2nd January 2026 - 04:07 PM ACDT"
+    day = now.day
+    ordinal = get_ordinal_suffix(day)
+    formatted = now.strftime(f"%A, {day}{ordinal} %B %Y - %I:%M %p {tz_abbrev}")
+    
+    return formatted, tz_string
+
+
+def add_timezone_to_response(response: dict) -> dict:
+    """
+    Add current_time and timezone fields to a response dict.
+    
+    Args:
+        response: The response dictionary to augment
+    
+    Returns:
+        Response dict with timezone info prepended (if enabled)
+    """
+    current_time, tz_string = format_current_time()
+    
+    if current_time is None:
+        # Timezone feature disabled - return response unchanged
+        return response
+    
+    # Create new dict with timezone fields first, then original response
+    return {
+        "current_time": current_time,
+        "timezone": tz_string,
+        **response
+    }
+
 
 def format_time_ago(timestamp_str: str) -> str:
     """
@@ -262,7 +332,8 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
         content_bytes = content.encode('utf-8')
         is_encrypted = False
     
-    # V2: Step 1 - Insert into memories table (source of truth)
+    # V3: Step 1 - Insert into memories table (source of truth)
+    # V3 structure: embedding_tables is an object mapping table names to model arrays
     cur.execute(
         """INSERT INTO memories (content, namespace, labels, source, enc, state)
         VALUES (%s, %s, %s, %s, %s, %s) RETURNING id;""",
@@ -272,7 +343,7 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
             psycopg2.extras.Json(label_list),
             source,
             is_encrypted,
-            psycopg2.extras.Json({'embedding_tables': [table_name]})
+            psycopg2.extras.Json({'embedding_tables': {table_name: [embedding_model]}})
         )
     )
     memory_id = cur.fetchone()[0]
@@ -297,7 +368,7 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
     if warnings:
         result["warnings"] = warnings
     
-    return result
+    return add_timezone_to_response(result)
 
 def retrieve_memories(query: str = None, labels: str = None, source: str = None, num_results: int = 5) -> dict:
     """
@@ -526,10 +597,10 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
     cur.close()
     conn.close()
     
-    return {
+    return add_timezone_to_response({
         "memories": memories,
         "count": len(memories)
-    }
+    })
 
 def delete_memory(memory_id: int) -> dict:
     """
@@ -564,17 +635,29 @@ def delete_memory(memory_id: int) -> dict:
         result = cur.fetchone()
         
         if not result:
-            return {
+            return add_timezone_to_response({
                 "success": False,
                 "error": f"❌ Memory #{memory_id} not found or access denied"
-            }
+            })
         
         # Get embedding tables from state
+        # V3 format: {"embedding_tables": {"memory_384": ["model1"], "memory_768": ["model2"]}}
+        # V2 format (backwards compat): {"embedding_tables": ["memory_384", "memory_768"]}
         state = result[1] if result[1] else {}
-        embedding_tables = state.get('embedding_tables', [])
+        embedding_tables_data = state.get('embedding_tables', {})
+        
+        # Handle both V3 (dict) and V2 (list) formats
+        if isinstance(embedding_tables_data, dict):
+            # V3 format - keys are table names
+            table_names = list(embedding_tables_data.keys())
+        elif isinstance(embedding_tables_data, list):
+            # V2 format - list of table names (backwards compatibility)
+            table_names = embedding_tables_data
+        else:
+            table_names = []
         
         # Delete from all tracked embedding tables (handles cross-dimensional cleanup)
-        for table_name in embedding_tables:
+        for table_name in table_names:
             try:
                 cur.execute(f"DELETE FROM {table_name} WHERE memory_id = %s;", (memory_id,))
                 logger.debug(f"Deleted embeddings from {table_name} for memory #{memory_id}")
@@ -602,22 +685,22 @@ def delete_memory(memory_id: int) -> dict:
         conn.commit()
         
         if deleted_id:
-            return {
+            return add_timezone_to_response({
                 "success": True,
                 "message": f"✅ Memory #{memory_id} deleted successfully"
-            }
+            })
         else:
-            return {
+            return add_timezone_to_response({
                 "success": False,
                 "error": f"❌ Memory #{memory_id} not found or access denied"
-            }
+            })
     
     except Exception as e:
         conn.rollback()
-        return {
+        return add_timezone_to_response({
             "success": False,
             "error": f"❌ Error deleting memory: {str(e)}"
-        }
+        })
     finally:
         cur.close()
         conn.close()
@@ -662,13 +745,13 @@ def get_memory(memory_id: int) -> dict:
             content = decode_or_decrypt_content(content_bytes, is_encrypted)
             if content is None:
                 if is_encrypted:
-                    return {
+                    return add_timezone_to_response({
                         "error": f"❌ Memory #{memory_id} is encrypted and cannot be decrypted (missing or wrong key)"
-                    }
+                    })
                 else:
-                    return {
+                    return add_timezone_to_response({
                         "error": f"❌ Memory #{memory_id} content could not be decoded"
-                    }
+                    })
             
             timestamp_iso = result[5].isoformat()
             memory = {
@@ -694,16 +777,16 @@ def get_memory(memory_id: int) -> dict:
                 "embedding_tables": embedding_tables
             }
             
-            return memory
+            return add_timezone_to_response(memory)
         else:
-            return {
+            return add_timezone_to_response({
                 "error": f"❌ Memory #{memory_id} not found or access denied"
-            }
+            })
     
     except Exception as e:
-        return {
+        return add_timezone_to_response({
             "error": f"❌ Error retrieving memory: {str(e)}"
-        }
+        })
     finally:
         cur.close()
         conn.close()
@@ -803,17 +886,17 @@ def random_memory(labels: str = None, source: str = None) -> dict:
                 "encrypted": is_encrypted
             }
             
-            return memory
+            return add_timezone_to_response(memory)
         
         # No valid memory found
-        return {
+        return add_timezone_to_response({
             "error": "❌ No memories found matching the criteria"
-        }
+        })
     
     except Exception as e:
-        return {
+        return add_timezone_to_response({
             "error": f"❌ Error retrieving random memory: {str(e)}"
-        }
+        })
     finally:
         cur.close()
         conn.close()
@@ -839,10 +922,10 @@ def add_labels(memory_id: int, labels: str) -> dict:
         new_labels = normalize_labels(labels)
     
     if not new_labels:
-        return {
+        return add_timezone_to_response({
             "success": False,
             "error": "❌ No valid labels provided"
-        }
+        })
     
     conn = get_db_connection()
     cur = conn.cursor()
@@ -867,10 +950,10 @@ def add_labels(memory_id: int, labels: str) -> dict:
         result = cur.fetchone()
         
         if not result:
-            return {
+            return add_timezone_to_response({
                 "success": False,
                 "error": f"❌ Memory #{memory_id} not found or access denied"
-            }
+            })
         
         # Parse existing labels
         existing_labels = []
@@ -892,18 +975,18 @@ def add_labels(memory_id: int, labels: str) -> dict:
         cur.execute(update_sql, (psycopg2.extras.Json(merged_labels), memory_id))
         conn.commit()
         
-        return {
+        return add_timezone_to_response({
             "success": True,
             "message": f"✅ Labels added to memory #{memory_id}",
             "labels": merged_labels
-        }
+        })
     
     except Exception as e:
         conn.rollback()
-        return {
+        return add_timezone_to_response({
             "success": False,
             "error": f"❌ Error adding labels: {str(e)}"
-        }
+        })
     finally:
         cur.close()
         conn.close()
@@ -929,10 +1012,10 @@ def del_labels(memory_id: int, labels: str) -> dict:
         labels_to_remove = normalize_labels(labels)
     
     if not labels_to_remove:
-        return {
+        return add_timezone_to_response({
             "success": False,
             "error": "❌ No valid labels provided"
-        }
+        })
     
     conn = get_db_connection()
     cur = conn.cursor()
@@ -957,10 +1040,10 @@ def del_labels(memory_id: int, labels: str) -> dict:
         result = cur.fetchone()
         
         if not result:
-            return {
+            return add_timezone_to_response({
                 "success": False,
                 "error": f"❌ Memory #{memory_id} not found or access denied"
-            }
+            })
         
         # Parse existing labels
         existing_labels = []
@@ -980,18 +1063,18 @@ def del_labels(memory_id: int, labels: str) -> dict:
         cur.execute(update_sql, (psycopg2.extras.Json(remaining_labels), memory_id))
         conn.commit()
         
-        return {
+        return add_timezone_to_response({
             "success": True,
             "message": f"✅ Labels removed from memory #{memory_id}",
             "labels": remaining_labels
-        }
+        })
     
     except Exception as e:
         conn.rollback()
-        return {
+        return add_timezone_to_response({
             "success": False,
             "error": f"❌ Error removing labels: {str(e)}"
-        }
+        })
     finally:
         cur.close()
         conn.close()

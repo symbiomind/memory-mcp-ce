@@ -1,11 +1,24 @@
 """
-Memory MCP-CE Database Module - V2 Split-Table Architecture
+Memory MCP-CE Database Module - V3 Split-Table Architecture
 
 This module handles:
 - Database connection management
 - Schema initialization (memories, system_state, memory_{dims} tables)
-- V1 → V2 migration for existing installations
+- V1 → V2 → V3 migration for existing installations
 - Version tracking via system_state singleton
+
+V3 Changes:
+- state.embedding_tables changed from array to object structure
+- Now tracks which models generated embeddings in each table
+- Enables A/B testing of embedding models
+
+V3 Structure:
+{
+    "embedding_tables": {
+        "memory_384": ["granite:30m", "other_model:32m"],
+        "memory_768": ["embeddinggemma:300m"]
+    }
+}
 """
 
 import psycopg2
@@ -19,7 +32,7 @@ from app.config import POSTGRES_HOST, POSTGRES_PORT, POSTGRES_USER, POSTGRES_PAS
 logger = logging.getLogger(__name__)
 
 # Current database schema version
-CURRENT_DB_VERSION = 2
+CURRENT_DB_VERSION = 3
 
 
 def get_db_connection():
@@ -415,6 +428,108 @@ def migrate_v1_to_v2(embedding_dim: int) -> None:
         conn.close()
 
 
+def migrate_v2_to_v3() -> None:
+    """
+    Migrate from V2 (array) to V3 (object) embedding_tables structure.
+    
+    V2 Structure: {"embedding_tables": ["memory_384", "memory_768"]}
+    V3 Structure: {"embedding_tables": {"memory_384": ["model1"], "memory_768": ["model2"]}}
+    
+    This migration:
+    1. Finds all memories with V2 array format in state.embedding_tables
+    2. For each memory, queries embedding tables to find actual models used
+    3. Converts to V3 object format with model arrays
+    """
+    logger.info("🔄 Starting V2 → V3 migration (embedding_tables array → object)...")
+    
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    
+    try:
+        # Find all memories that need migration
+        # V2 format has embedding_tables as an array (jsonb_typeof = 'array')
+        cur.execute("""
+            SELECT id, state->'embedding_tables' as embedding_tables
+            FROM memories
+            WHERE state->'embedding_tables' IS NOT NULL
+            AND jsonb_typeof(state->'embedding_tables') = 'array';
+        """)
+        memories_to_migrate = cur.fetchall()
+        
+        if not memories_to_migrate:
+            logger.info("📭 No V2 memories found to migrate")
+            set_system_state(db_version=CURRENT_DB_VERSION)
+            return
+        
+        logger.info(f"📋 Found {len(memories_to_migrate)} memories to migrate to V3 format")
+        
+        migrated_count = 0
+        for memory in memories_to_migrate:
+            memory_id = memory['id']
+            old_tables = memory['embedding_tables']  # This is an array like ["memory_384"]
+            
+            # Build new V3 structure by querying each embedding table
+            new_structure = {}
+            
+            for table_name in old_tables:
+                # Check if this table exists
+                if not table_exists(table_name):
+                    logger.debug(f"   Table {table_name} no longer exists, skipping")
+                    continue
+                
+                # Query the embedding table to find models used for this memory
+                try:
+                    cur.execute(f"""
+                        SELECT DISTINCT embedding_model
+                        FROM {table_name}
+                        WHERE memory_id = %s;
+                    """, (memory_id,))
+                    models = [row['embedding_model'] for row in cur.fetchall()]
+                    
+                    if models:
+                        new_structure[table_name] = models
+                    else:
+                        # Table entry exists in state but no embeddings found
+                        # This could happen if embeddings were deleted but state wasn't updated
+                        logger.debug(f"   No embeddings found in {table_name} for memory #{memory_id}")
+                except Exception as e:
+                    logger.warning(f"   Error querying {table_name}: {e}")
+                    continue
+            
+            # Update memory with new V3 structure
+            cur.execute("""
+                UPDATE memories
+                SET state = jsonb_set(
+                    COALESCE(state, '{}'::jsonb),
+                    '{embedding_tables}',
+                    %s::jsonb,
+                    true
+                )
+                WHERE id = %s;
+            """, (psycopg2.extras.Json(new_structure), memory_id))
+            
+            migrated_count += 1
+            
+            if migrated_count % 100 == 0:
+                conn.commit()
+                logger.info(f"   Migrated {migrated_count}/{len(memories_to_migrate)} memories...")
+        
+        conn.commit()
+        
+        # Update system state to V3
+        set_system_state(db_version=CURRENT_DB_VERSION)
+        
+        logger.info(f"🎉 V2 → V3 migration complete! Migrated {migrated_count} memories")
+        
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"❌ V2 → V3 migration failed: {e}")
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
 def init_database(embedding_dim: int) -> None:
     """
     Initialize the database schema.
@@ -491,7 +606,16 @@ def init_database(embedding_dim: int) -> None:
         
         if current_version < CURRENT_DB_VERSION:
             logger.info(f"🔍 Database version {current_version} < {CURRENT_DB_VERSION} - migration required")
-            migrate_v1_to_v2(embedding_dim)
+            
+            # Run migrations in sequence
+            if current_version == 1:
+                # V1 → V2 migration (split tables)
+                migrate_v1_to_v2(embedding_dim)
+                # After V1→V2, run V2→V3 as well
+                migrate_v2_to_v3()
+            elif current_version == 2:
+                # V2 → V3 migration (embedding_tables array → object)
+                migrate_v2_to_v3()
         else:
             logger.info(f"✅ Database schema is up to date (version {current_version})")
     
@@ -528,43 +652,67 @@ def update_memory_state(memory_id: int, state_updates: dict) -> None:
         conn.close()
 
 
-def add_embedding_table_to_state(memory_id: int, table_name: str) -> None:
+def add_embedding_to_state(memory_id: int, table_name: str, model_name: str) -> None:
     """
-    Add an embedding table to a memory's state.embedding_tables array.
+    Add an embedding model to a memory's state.embedding_tables[table_name] array.
     
-    This tracks which embedding tables have embeddings for this memory,
-    enabling proper cleanup on delete.
+    V3 Structure:
+    {
+        "embedding_tables": {
+            "memory_384": ["granite:30m", "other_model:32m"],
+            "memory_768": ["embeddinggemma:300m"]
+        }
+    }
+    
+    This tracks which embedding models have generated embeddings in each table
+    for this memory, enabling A/B testing and proper cleanup on delete.
     """
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        # Add table_name to embedding_tables array if not already present
+        # Use PostgreSQL JSONB operations to add model to table's array
+        # 1. Ensure embedding_tables exists as an object
+        # 2. Ensure the table_name key exists with an array
+        # 3. Append model_name if not already present
         cur.execute("""
             UPDATE memories
             SET state = jsonb_set(
-                COALESCE(state, '{}'::jsonb),
-                '{embedding_tables}',
-                COALESCE(state->'embedding_tables', '[]'::jsonb) || 
-                CASE WHEN state->'embedding_tables' @> %s::jsonb 
-                     THEN '[]'::jsonb 
-                     ELSE %s::jsonb 
-                END,
+                jsonb_set(
+                    COALESCE(state, '{}'::jsonb),
+                    '{embedding_tables}',
+                    COALESCE(state->'embedding_tables', '{}'::jsonb),
+                    true
+                ),
+                ARRAY['embedding_tables', %s],
+                (
+                    SELECT CASE 
+                        WHEN COALESCE(state->'embedding_tables'->%s, '[]'::jsonb) @> %s::jsonb
+                        THEN COALESCE(state->'embedding_tables'->%s, '[]'::jsonb)
+                        ELSE COALESCE(state->'embedding_tables'->%s, '[]'::jsonb) || %s::jsonb
+                    END
+                ),
                 true
             )
             WHERE id = %s;
-        """, (f'["{table_name}"]', f'["{table_name}"]', memory_id))
+        """, (table_name, table_name, f'["{model_name}"]', table_name, table_name, f'["{model_name}"]', memory_id))
         conn.commit()
     finally:
         cur.close()
         conn.close()
 
 
-def get_memory_embedding_tables(memory_id: int) -> list[str]:
+def get_memory_embedding_tables(memory_id: int) -> dict[str, list[str]]:
     """
-    Get the list of embedding tables that have embeddings for a memory.
+    Get the embedding tables and their models for a memory.
+    
+    V3 Structure:
+    {
+        "memory_384": ["granite:30m", "other_model:32m"],
+        "memory_768": ["embeddinggemma:300m"]
+    }
     
     Returns:
-        List of table names (e.g., ['memory_384', 'memory_768'])
+        Dict mapping table names to list of model names
     """
     conn = get_db_connection()
     cur = conn.cursor()
@@ -576,8 +724,16 @@ def get_memory_embedding_tables(memory_id: int) -> list[str]:
         """, (memory_id,))
         result = cur.fetchone()
         if result and result[0]:
-            return result[0]
-        return []
+            # Handle both V2 (array) and V3 (object) formats for backwards compatibility
+            embedding_tables = result[0]
+            if isinstance(embedding_tables, list):
+                # V2 format - convert to V3 format with empty model arrays
+                # This shouldn't happen after migration, but handle gracefully
+                return {table: [] for table in embedding_tables}
+            elif isinstance(embedding_tables, dict):
+                # V3 format - return as-is
+                return embedding_tables
+        return {}
     finally:
         cur.close()
         conn.close()

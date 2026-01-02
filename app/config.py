@@ -1,9 +1,14 @@
 
 import os
+import logging
 from dotenv import load_dotenv
+from zoneinfo import ZoneInfo, available_timezones
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Get logger for config module
+config_logger = logging.getLogger(__name__)
 
 # PostgreSQL Configuration
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
@@ -52,3 +57,34 @@ OAUTH_REDIRECT_URIS = os.getenv(
     "OAUTH_REDIRECT_URIS",
     "https://claude.ai/api/mcp/auth_callback,http://localhost/callback,http://127.0.0.1/callback"
 )
+
+# Timezone Configuration
+# Options:
+#   - Valid timezone string (e.g., Australia/Adelaide, America/New_York, Europe/London)
+#   - UTC (default if not set or invalid)
+#   - false (disables timezone feature entirely - no current_time or timezone fields in responses)
+def _parse_timezone_config():
+    """Parse and validate TIMEZONE configuration."""
+    tz_value = os.getenv("TIMEZONE", "").strip()
+    
+    # Check for "false" (case-insensitive) - disable feature entirely
+    if tz_value.lower() == "false":
+        config_logger.info("⏰ Timezone feature disabled (TIMEZONE=false)")
+        return None, True  # None timezone, feature disabled
+    
+    # Empty string or not set - default to UTC
+    if not tz_value:
+        config_logger.info("⏰ Timezone defaulting to UTC (TIMEZONE not set)")
+        return ZoneInfo("UTC"), False
+    
+    # Try to parse as valid timezone
+    if tz_value in available_timezones():
+        config_logger.info(f"⏰ Timezone configured: {tz_value}")
+        return ZoneInfo(tz_value), False
+    
+    # Invalid timezone - warn and fall back to UTC
+    config_logger.warning(f"⚠️ Invalid timezone '{tz_value}', falling back to UTC")
+    return ZoneInfo("UTC"), False
+
+# Parse timezone on startup
+TIMEZONE, TIMEZONE_DISABLED = _parse_timezone_config()
