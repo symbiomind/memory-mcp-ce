@@ -360,6 +360,7 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
     conn.close()
 
     result = {
+        "current_embedding": embedding_model,
         "id": memory_id,
         "source": source,
         "message": f"✅ Memory stored with ID {memory_id}" + (" 🔐" if is_encrypted else "")
@@ -431,7 +432,7 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
         # Build SQL query with JOIN to memories table
         sql = f"""
             SELECT m.id, m.content, e.embedding_model, m.namespace, m.labels, m.source, m.timestamp, 
-                   1 - (e.embedding <=> %s::vector) as similarity, m.enc
+                   1 - (e.embedding <=> %s::vector) as similarity, m.enc, m.state
             FROM memories m
             JOIN {table_name} e ON m.id = e.memory_id
         """
@@ -504,11 +505,16 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
             if row[4]:
                 memory["labels"] = row[4] if isinstance(row[4], list) else json.loads(row[4])
             
+            # Get embedding_tables from state
+            state = row[9] if row[9] else {}
+            embedding_tables = state.get('embedding_tables', {})
+            
             memory["meta"] = {
                 "timestamp": timestamp_iso,
                 "embedding_model": row[2],
                 "embedding_dims": embedding_dim,
-                "encrypted": is_encrypted
+                "encrypted": is_encrypted,
+                "embedding_tables": embedding_tables
             }
             
             memories.append(memory)
@@ -518,7 +524,7 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
         # This works regardless of embedding model changes!
         
         sql = """
-            SELECT id, content, namespace, labels, source, timestamp, enc
+            SELECT id, content, namespace, labels, source, timestamp, enc, state
             FROM memories
         """
         
@@ -585,11 +591,16 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
             if row[3]:
                 memory["labels"] = row[3] if isinstance(row[3], list) else json.loads(row[3])
             
+            # Get embedding_tables from state
+            state = row[7] if row[7] else {}
+            embedding_tables = state.get('embedding_tables', {})
+            
             # For non-semantic queries, we don't have embedding info from the query
             memory["meta"] = {
                 "timestamp": timestamp_iso,
                 "namespace": row[2],
-                "encrypted": is_encrypted
+                "encrypted": is_encrypted,
+                "embedding_tables": embedding_tables
             }
             
             memories.append(memory)
@@ -597,10 +608,15 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
     cur.close()
     conn.close()
     
-    return add_timezone_to_response({
+    # Build response - add current_embedding for semantic queries only
+    response = {
         "memories": memories,
         "count": len(memories)
-    })
+    }
+    if query:
+        response = {"current_embedding": embedding_model, **response}
+    
+    return add_timezone_to_response(response)
 
 def delete_memory(memory_id: int) -> dict:
     """
@@ -767,7 +783,7 @@ def get_memory(memory_id: int) -> dict:
             
             # Get embedding info from state
             state = result[7] if result[7] else {}
-            embedding_tables = state.get('embedding_tables', [])
+            embedding_tables = state.get('embedding_tables', {})
             
             # Add meta
             memory["meta"] = {
@@ -815,7 +831,7 @@ def random_memory(labels: str = None, source: str = None) -> dict:
     try:
         # Query memories table directly (source of truth)
         sql = """
-            SELECT id, content, namespace, labels, source, timestamp, enc
+            SELECT id, content, namespace, labels, source, timestamp, enc, state
             FROM memories
         """
         
@@ -879,11 +895,16 @@ def random_memory(labels: str = None, source: str = None) -> dict:
             if result[3]:
                 memory["labels"] = result[3] if isinstance(result[3], list) else json.loads(result[3])
             
+            # Get embedding_tables from state
+            state = result[7] if result[7] else {}
+            embedding_tables = state.get('embedding_tables', {})
+            
             # Add meta
             memory["meta"] = {
                 "timestamp": timestamp_iso,
                 "namespace": result[2],
-                "encrypted": is_encrypted
+                "encrypted": is_encrypted,
+                "embedding_tables": embedding_tables
             }
             
             return add_timezone_to_response(memory)
