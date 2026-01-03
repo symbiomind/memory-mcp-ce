@@ -24,3 +24,4 @@ __pycache__/
 
 # Docker
 *.log
+test-compose.yml

@@ -1,11 +1,16 @@
 """
-Memory MCP-CE Database Module - V3 Split-Table Architecture
+Memory MCP-CE Database Module - V4 HNSW Index Architecture
 
 This module handles:
 - Database connection management
 - Schema initialization (memories, system_state, memory_{dims} tables)
-- V1 → V2 → V3 migration for existing installations
+- V1 → V2 → V3 → V4 migration for existing installations
 - Version tracking via system_state singleton
+
+V4 Changes:
+- Migrated from ivfflat to HNSW indexes for embedding tables
+- HNSW indexes support unlimited dimensions (ivfflat had 2000-dim limit)
+- Enables use of large embedding models (e.g., Qwen 4096D)
 
 V3 Changes:
 - state.embedding_tables changed from array to object structure
@@ -32,7 +37,7 @@ from app.config import POSTGRES_HOST, POSTGRES_PORT, POSTGRES_USER, POSTGRES_PAS
 logger = logging.getLogger(__name__)
 
 # Current database schema version
-CURRENT_DB_VERSION = 3
+CURRENT_DB_VERSION = 4
 
 
 def get_db_connection():
@@ -223,11 +228,10 @@ def create_embedding_table(embedding_dim: int) -> None:
             );
         """)
         
-        # Create indexes for semantic queries
+        # Create indexes for semantic queries (HNSW for unlimited dimensions)
         cur.execute(f"""
             CREATE INDEX IF NOT EXISTS idx_embedding_{embedding_dim} 
-            ON {table_name} USING ivfflat (embedding vector_cosine_ops) 
-            WITH (lists = 100);
+            ON {table_name} USING hnsw (embedding vector_cosine_ops);
         """)
         
         cur.execute(f"""
@@ -530,6 +534,73 @@ def migrate_v2_to_v3() -> None:
         conn.close()
 
 
+def migrate_v3_to_v4() -> None:
+    """
+    Migrate from V3 (ivfflat indexes) to V4 (HNSW indexes).
+    
+    HNSW indexes support unlimited dimensions and offer better query performance
+    compared to ivfflat which has a 2000-dimension hard limit.
+    
+    This migration:
+    1. Finds all existing memory_{dims} tables
+    2. Drops old ivfflat indexes
+    3. Creates new HNSW indexes
+    """
+    logger.info("🔄 Starting V3 → V4 migration (ivfflat → HNSW indexes)...")
+    
+    # Check if already at V4
+    system_state = get_system_state()
+    if system_state and system_state.get('db_version', 0) >= 4:
+        logger.info("✅ Already at V4, skipping migration")
+        return
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Find all existing memory_{dims} tables
+        existing_tables = get_existing_embedding_tables()
+        
+        if not existing_tables:
+            logger.info("📭 No embedding tables found to migrate")
+            set_system_state(db_version=CURRENT_DB_VERSION)
+            return
+        
+        logger.info(f"📋 Found {len(existing_tables)} embedding tables to migrate: {existing_tables}")
+        
+        for table_name in existing_tables:
+            # Extract dimension number from table name (e.g., memory_768 → 768)
+            dims = table_name.replace('memory_', '')
+            
+            logger.info(f"📊 Migrating {table_name} index to HNSW...")
+            
+            # Drop old ivfflat index
+            cur.execute(f"DROP INDEX IF EXISTS idx_embedding_{dims};")
+            
+            # Create new HNSW index
+            cur.execute(f"""
+                CREATE INDEX idx_embedding_{dims} 
+                ON {table_name} USING hnsw (embedding vector_cosine_ops);
+            """)
+            
+            logger.info(f"✅ Migrated {table_name} to HNSW index")
+        
+        conn.commit()
+        
+        # Update schema version to V4
+        set_system_state(db_version=CURRENT_DB_VERSION)
+        
+        logger.info("🎉 V3 → V4 migration complete!")
+        
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"❌ V3 → V4 migration failed: {e}")
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
 def init_database(embedding_dim: int) -> None:
     """
     Initialize the database schema.
@@ -613,9 +684,16 @@ def init_database(embedding_dim: int) -> None:
                 migrate_v1_to_v2(embedding_dim)
                 # After V1→V2, run V2→V3 as well
                 migrate_v2_to_v3()
+                # After V2→V3, run V3→V4 as well
+                migrate_v3_to_v4()
             elif current_version == 2:
                 # V2 → V3 migration (embedding_tables array → object)
                 migrate_v2_to_v3()
+                # After V2→V3, run V3→V4 as well
+                migrate_v3_to_v4()
+            elif current_version == 3:
+                # V3 → V4 migration (ivfflat → HNSW indexes)
+                migrate_v3_to_v4()
         else:
             logger.info(f"✅ Database schema is up to date (version {current_version})")
     

@@ -2,6 +2,11 @@
 from openai import OpenAI
 from app.config import EMBEDDING_URL, EMBEDDING_MODEL, EMBEDDING_API_KEY
 
+# Module-level cache for embedding dimension validation
+# Prevents redundant API calls on every retrieve_memories query
+_validated_embedding_model = None
+_validated_embedding_dims = None
+
 client = OpenAI(
     base_url=EMBEDDING_URL,
     api_key=EMBEDDING_API_KEY or "dummy-key", # a dummy key is required for the client to work
@@ -12,7 +17,18 @@ client = OpenAI(
 )
 
 def get_embedding_dimension() -> int:
-    """Detects the embedding dimension by sending a test request and validates it's actually a vector."""
+    """
+    Detects the embedding dimension by sending a test request and validates it's actually a vector.
+    
+    Uses module-level caching to avoid redundant API calls on every retrieve_memories query.
+    Re-validates only when EMBEDDING_MODEL changes.
+    """
+    global _validated_embedding_model, _validated_embedding_dims
+    
+    # Return cached result if model hasn't changed
+    if _validated_embedding_model == EMBEDDING_MODEL and _validated_embedding_dims is not None:
+        return _validated_embedding_dims
+    
     try:
         response = client.embeddings.create(
             model=EMBEDDING_MODEL,
@@ -44,6 +60,10 @@ def get_embedding_dimension() -> int:
                 f"Embedding contains non-numeric values. "
                 f"Is '{EMBEDDING_MODEL}' configured correctly?"
             )
+        
+        # Cache the validated result
+        _validated_embedding_model = EMBEDDING_MODEL
+        _validated_embedding_dims = actual_dims
         
         print(f"✓ Validated embedding model: {EMBEDDING_MODEL} ({actual_dims}D vector)")
         return actual_dims
