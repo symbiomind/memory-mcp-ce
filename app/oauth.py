@@ -5,6 +5,11 @@ Implements the MCP SDK's OAuthAuthorizationServerProvider protocol
 for bundled OAuth support (combined AS + RS in one server).
 
 Based on the MCP Python SDK v1.24.0 simple-auth example.
+
+Session Persistence:
+- OAuth sessions (tokens, clients) are persisted to the system_state table
+- Sessions survive container restarts
+- Expired sessions are cleaned up on startup and lazily on access
 """
 
 import logging
@@ -39,6 +44,14 @@ from app.config import (
     OAUTH_AUTH_CODE_EXPIRY,
     OAUTH_REDIRECT_URIS,
 )
+from app.database import (
+    load_oauth_sessions,
+    save_oauth_client,
+    save_oauth_access_token,
+    save_oauth_refresh_token,
+    delete_oauth_token,
+    delete_oauth_client,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,19 +80,90 @@ class MemoryOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         self.server_url = server_url.rstrip("/")
         self.login_path = login_path
         
-        # In-memory storage
+        # In-memory storage (will be populated from database)
         self.clients: dict[str, OAuthClientInformationFull] = {}
-        self.auth_codes: dict[str, AuthorizationCode] = {}
+        self.auth_codes: dict[str, AuthorizationCode] = {}  # Not persisted (short-lived)
         self.tokens: dict[str, AccessToken] = {}
         self.refresh_tokens: dict[str, RefreshToken] = {}  # refresh_token -> RefreshToken object
         self.refresh_to_access: dict[str, str] = {}  # refresh_token -> access_token (for cleanup)
-        self.state_mapping: dict[str, dict[str, Any]] = {}
+        self.state_mapping: dict[str, dict[str, Any]] = {}  # Not persisted (transient CSRF state)
+        
+        # Load persisted sessions from database
+        self._load_sessions_from_db()
         
         # Pre-register default client for Claude Desktop compatibility
         # Claude Desktop may use a pre-configured client_id without dynamic registration
         self._register_default_client()
         
         logger.info(f"MemoryOAuthProvider initialized with server_url: {self.server_url}")
+    
+    def _load_sessions_from_db(self) -> None:
+        """
+        Load OAuth sessions from the database on startup.
+        
+        This restores authenticated sessions across container restarts.
+        Expired sessions are cleaned up during load.
+        """
+        try:
+            sessions = load_oauth_sessions()
+            
+            # Restore clients (dynamically registered)
+            for client_id, client_data in sessions.get("clients", {}).items():
+                try:
+                    # Convert stored dict back to OAuthClientInformationFull
+                    # Need to handle AnyUrl conversion for redirect_uris
+                    if "redirect_uris" in client_data:
+                        client_data["redirect_uris"] = [
+                            AnyUrl(uri) for uri in client_data["redirect_uris"]
+                        ]
+                    self.clients[client_id] = OAuthClientInformationFull(**client_data)
+                    logger.debug(f"🔄 Restored client: {client_id}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to restore client {client_id}: {e}")
+            
+            # Restore access tokens
+            for token, token_data in sessions.get("access_tokens", {}).items():
+                try:
+                    self.tokens[token] = AccessToken(
+                        token=token_data.get("token", token),
+                        client_id=token_data.get("client_id"),
+                        scopes=token_data.get("scopes", []),
+                        expires_at=token_data.get("expires_at"),
+                        resource=token_data.get("resource"),
+                    )
+                    logger.debug(f"🔄 Restored access token: {token[:10]}...")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to restore access token: {e}")
+            
+            # Restore refresh tokens
+            for token, token_data in sessions.get("refresh_tokens", {}).items():
+                try:
+                    self.refresh_tokens[token] = RefreshToken(
+                        token=token_data.get("token", token),
+                        client_id=token_data.get("client_id"),
+                        scopes=token_data.get("scopes", []),
+                        expires_at=token_data.get("expires_at"),
+                    )
+                    logger.debug(f"🔄 Restored refresh token: {token[:20]}...")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to restore refresh token: {e}")
+            
+            # Restore refresh_to_access mapping
+            self.refresh_to_access = sessions.get("refresh_to_access", {})
+            
+            # Log summary
+            num_clients = len(sessions.get("clients", {}))
+            num_access = len(sessions.get("access_tokens", {}))
+            num_refresh = len(sessions.get("refresh_tokens", {}))
+            
+            if num_clients or num_access or num_refresh:
+                logger.info(f"🔄 Restored OAuth sessions: {num_clients} clients, {num_access} access tokens, {num_refresh} refresh tokens")
+            else:
+                logger.info("📝 No persisted OAuth sessions found")
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to load OAuth sessions from database: {e}")
+            logger.info("📝 Starting with empty OAuth session store")
     
     def _register_default_client(self) -> None:
         """Pre-register default OAuth client for Claude Desktop compatibility."""
@@ -123,6 +207,15 @@ class MemoryOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             raise ValueError("No client_id provided")
         
         self.clients[client_info.client_id] = client_info
+        
+        # Persist to database
+        try:
+            # Convert to dict for JSON storage
+            client_data = client_info.model_dump(mode="json")
+            save_oauth_client(client_info.client_id, client_data)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to persist client {client_info.client_id}: {e}")
+        
         logger.info(f"✅ Client registered: {client_info.client_id}")
     
     async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
@@ -364,7 +457,7 @@ class MemoryOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         refresh_token_str = f"mcp_refresh_{secrets.token_hex(32)}"
         refresh_expires_at = int(time.time()) + OAUTH_REFRESH_TOKEN_EXPIRY
         
-        # Store access token
+        # Store access token in memory
         self.tokens[access_token] = AccessToken(
             token=access_token,
             client_id=client.client_id,
@@ -373,7 +466,7 @@ class MemoryOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             resource=authorization_code.resource,
         )
         
-        # Store refresh token
+        # Store refresh token in memory
         self.refresh_tokens[refresh_token_str] = RefreshToken(
             token=refresh_token_str,
             client_id=client.client_id,
@@ -383,6 +476,29 @@ class MemoryOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         
         # Map refresh token to access token (for cleanup on rotation)
         self.refresh_to_access[refresh_token_str] = access_token
+        
+        # Persist tokens to database
+        try:
+            # Persist access token
+            save_oauth_access_token(access_token, {
+                "token": access_token,
+                "client_id": client.client_id,
+                "scopes": authorization_code.scopes,
+                "expires_at": access_expires_at,
+                "resource": str(authorization_code.resource) if authorization_code.resource else None,
+            })
+            
+            # Persist refresh token (includes mapping)
+            save_oauth_refresh_token(refresh_token_str, {
+                "token": refresh_token_str,
+                "client_id": client.client_id,
+                "scopes": authorization_code.scopes,
+                "expires_at": refresh_expires_at,
+            }, access_token)
+            
+            logger.debug(f"💾 Persisted tokens for client: {client.client_id}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to persist tokens: {e}")
         
         # Remove used authorization code
         del self.auth_codes[authorization_code.code]
@@ -427,10 +543,17 @@ class MemoryOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         if not access_token:
             return None
         
-        # Check expiry
+        # Check expiry (lazy cleanup)
         if access_token.expires_at and access_token.expires_at < time.time():
             logger.info(f"Token expired, removing: {token[:10]}...")
             del self.tokens[token]
+            
+            # Also clean up from database
+            try:
+                delete_oauth_token(token, "access")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to delete expired token from DB: {e}")
+            
             return None
         
         logger.info(f"✅ Authenticated via OAuth token for client: {access_token.client_id}")
@@ -459,13 +582,20 @@ class MemoryOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             logger.warning(f"Refresh token client mismatch: {stored_token.client_id} != {client.client_id}")
             return None
         
-        # Check expiry
+        # Check expiry (lazy cleanup)
         if stored_token.expires_at and stored_token.expires_at < time.time():
             logger.warning(f"Refresh token expired: {refresh_token[:20]}...")
-            # Clean up expired token
+            # Clean up expired token from memory
             del self.refresh_tokens[refresh_token]
             if refresh_token in self.refresh_to_access:
                 del self.refresh_to_access[refresh_token]
+            
+            # Also clean up from database
+            try:
+                delete_oauth_token(refresh_token, "refresh")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to delete expired refresh token from DB: {e}")
+            
             return None
         
         logger.info(f"✅ Refresh token loaded for client: {client.client_id}")
@@ -520,7 +650,7 @@ class MemoryOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         new_refresh_token_str = f"mcp_refresh_{secrets.token_hex(32)}"
         refresh_expires_at = int(time.time()) + OAUTH_REFRESH_TOKEN_EXPIRY
         
-        # Store new access token
+        # Store new access token in memory
         self.tokens[new_access_token] = AccessToken(
             token=new_access_token,
             client_id=client.client_id,
@@ -528,7 +658,7 @@ class MemoryOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             expires_at=access_expires_at,
         )
         
-        # Store new refresh token
+        # Store new refresh token in memory
         self.refresh_tokens[new_refresh_token_str] = RefreshToken(
             token=new_refresh_token_str,
             client_id=client.client_id,
@@ -539,12 +669,41 @@ class MemoryOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         # Map new refresh token to new access token
         self.refresh_to_access[new_refresh_token_str] = new_access_token
         
-        # Invalidate old refresh token (rotation)
+        # Persist new tokens to database and delete old ones
+        try:
+            # Persist new access token
+            save_oauth_access_token(new_access_token, {
+                "token": new_access_token,
+                "client_id": client.client_id,
+                "scopes": token_scopes,
+                "expires_at": access_expires_at,
+            })
+            
+            # Persist new refresh token (includes mapping)
+            save_oauth_refresh_token(new_refresh_token_str, {
+                "token": new_refresh_token_str,
+                "client_id": client.client_id,
+                "scopes": token_scopes,
+                "expires_at": refresh_expires_at,
+            }, new_access_token)
+            
+            # Delete old refresh token from database
+            delete_oauth_token(refresh_token.token, "refresh")
+            
+            # Delete old access token from database
+            if old_access_token:
+                delete_oauth_token(old_access_token, "access")
+            
+            logger.debug(f"💾 Persisted rotated tokens for client: {client.client_id}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to persist rotated tokens: {e}")
+        
+        # Invalidate old refresh token in memory (rotation)
         del self.refresh_tokens[refresh_token.token]
         if refresh_token.token in self.refresh_to_access:
             del self.refresh_to_access[refresh_token.token]
         
-        # Invalidate old access token
+        # Invalidate old access token in memory
         if old_access_token and old_access_token in self.tokens:
             del self.tokens[old_access_token]
         
@@ -572,21 +731,30 @@ class MemoryOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             token: The token to revoke
         """
         if isinstance(token, RefreshToken):
-            # Revoke refresh token
+            # Revoke refresh token from memory
             if token.token in self.refresh_tokens:
                 del self.refresh_tokens[token.token]
                 logger.info(f"Refresh token revoked: {token.token[:20]}...")
             
             # Also revoke associated access token
+            access_token_str = None
             if token.token in self.refresh_to_access:
-                access_token = self.refresh_to_access[token.token]
-                if access_token in self.tokens:
-                    del self.tokens[access_token]
-                    logger.info(f"Associated access token revoked: {access_token[:10]}...")
+                access_token_str = self.refresh_to_access[token.token]
+                if access_token_str in self.tokens:
+                    del self.tokens[access_token_str]
+                    logger.info(f"Associated access token revoked: {access_token_str[:10]}...")
                 del self.refresh_to_access[token.token]
+            
+            # Delete from database
+            try:
+                delete_oauth_token(token.token, "refresh")
+                if access_token_str:
+                    delete_oauth_token(access_token_str, "access")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to delete revoked tokens from DB: {e}")
                 
         elif isinstance(token, AccessToken):
-            # Revoke access token
+            # Revoke access token from memory
             if token.token in self.tokens:
                 del self.tokens[token.token]
                 logger.info(f"Access token revoked: {token.token[:10]}...")
@@ -601,3 +769,11 @@ class MemoryOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
                     del self.refresh_tokens[rt]
                     logger.info(f"Associated refresh token revoked: {rt[:20]}...")
                 del self.refresh_to_access[rt]
+            
+            # Delete from database
+            try:
+                delete_oauth_token(token.token, "access")
+                for rt in refresh_tokens_to_remove:
+                    delete_oauth_token(rt, "refresh")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to delete revoked tokens from DB: {e}")

@@ -5,6 +5,7 @@ This module handles:
 - Database connection management
 - Schema initialization (memories, system_state, memory_{dims} tables)
 - Version tracking via system_state key-value store
+- OAuth session persistence
 
 Migrations are handled by the app.migrations module.
 
@@ -17,7 +18,9 @@ V5 Schema:
 import psycopg2
 import psycopg2.extras
 import logging
-from typing import Optional
+import hashlib
+import time
+from typing import Optional, Any
 from app.config import POSTGRES_HOST, POSTGRES_PORT, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB
 
 # Configure logging
@@ -422,6 +425,308 @@ def get_memory_embedding_tables(memory_id: int) -> dict[str, list[str]]:
                 # V3 format - return as-is
                 return embedding_tables
         return {}
+    finally:
+        cur.close()
+        conn.close()
+
+
+# =============================================================================
+# OAuth Session Persistence Functions
+# =============================================================================
+
+def _oauth_key_hash(token: str) -> str:
+    """
+    Generate a short hash for OAuth token keys.
+    
+    Uses SHA256 truncated to 16 characters for clean, predictable keys
+    while the full token is stored in JSONB value.
+    
+    Args:
+        token: The OAuth token string
+        
+    Returns:
+        16-character hex hash
+    """
+    return hashlib.sha256(token.encode()).hexdigest()[:16]
+
+
+def save_oauth_client(client_id: str, client_data: dict) -> None:
+    """
+    Save an OAuth client registration to the database.
+    
+    Args:
+        client_id: The client ID
+        client_data: Client data (serialized OAuthClientInformationFull)
+    """
+    key = f"oauth:client:{client_id}"
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO system_state (key, value)
+            VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE SET
+                value = EXCLUDED.value,
+                updated_at = CURRENT_TIMESTAMP;
+        """, (key, psycopg2.extras.Json(client_data)))
+        conn.commit()
+        logger.debug(f"💾 Saved OAuth client: {client_id}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+def save_oauth_access_token(token: str, token_data: dict) -> None:
+    """
+    Save an OAuth access token to the database.
+    
+    Args:
+        token: The access token string
+        token_data: Token data (token, client_id, scopes, expires_at, resource)
+    """
+    key = f"oauth:access_token:{_oauth_key_hash(token)}"
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO system_state (key, value)
+            VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE SET
+                value = EXCLUDED.value,
+                updated_at = CURRENT_TIMESTAMP;
+        """, (key, psycopg2.extras.Json(token_data)))
+        conn.commit()
+        logger.debug(f"💾 Saved OAuth access token: {token[:10]}...")
+    finally:
+        cur.close()
+        conn.close()
+
+
+def save_oauth_refresh_token(token: str, token_data: dict, access_token: str) -> None:
+    """
+    Save an OAuth refresh token and its mapping to access token.
+    
+    Args:
+        token: The refresh token string
+        token_data: Token data (token, client_id, scopes, expires_at)
+        access_token: The associated access token
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        # Save refresh token
+        refresh_key = f"oauth:refresh_token:{_oauth_key_hash(token)}"
+        cur.execute("""
+            INSERT INTO system_state (key, value)
+            VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE SET
+                value = EXCLUDED.value,
+                updated_at = CURRENT_TIMESTAMP;
+        """, (refresh_key, psycopg2.extras.Json(token_data)))
+        
+        # Save refresh_to_access mapping
+        mapping_key = f"oauth:refresh_to_access:{_oauth_key_hash(token)}"
+        cur.execute("""
+            INSERT INTO system_state (key, value)
+            VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE SET
+                value = EXCLUDED.value,
+                updated_at = CURRENT_TIMESTAMP;
+        """, (mapping_key, psycopg2.extras.Json({"access_token": access_token})))
+        
+        conn.commit()
+        logger.debug(f"💾 Saved OAuth refresh token: {token[:20]}...")
+    finally:
+        cur.close()
+        conn.close()
+
+
+def delete_oauth_token(token: str, token_type: str = "access") -> None:
+    """
+    Delete an OAuth token from the database.
+    
+    Args:
+        token: The token string
+        token_type: "access" or "refresh"
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        if token_type == "access":
+            key = f"oauth:access_token:{_oauth_key_hash(token)}"
+        else:
+            # For refresh tokens, delete both the token and the mapping
+            key = f"oauth:refresh_token:{_oauth_key_hash(token)}"
+            mapping_key = f"oauth:refresh_to_access:{_oauth_key_hash(token)}"
+            cur.execute("DELETE FROM system_state WHERE key = %s;", (mapping_key,))
+        
+        cur.execute("DELETE FROM system_state WHERE key = %s;", (key,))
+        conn.commit()
+        logger.debug(f"🗑️ Deleted OAuth {token_type} token: {token[:10]}...")
+    finally:
+        cur.close()
+        conn.close()
+
+
+def delete_oauth_client(client_id: str) -> None:
+    """
+    Delete an OAuth client from the database.
+    
+    Args:
+        client_id: The client ID to delete
+    """
+    key = f"oauth:client:{client_id}"
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM system_state WHERE key = %s;", (key,))
+        conn.commit()
+        logger.debug(f"🗑️ Deleted OAuth client: {client_id}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+def load_oauth_sessions() -> dict[str, Any]:
+    """
+    Load all OAuth session data from the database.
+    
+    Returns a dict with:
+    - clients: dict of client_id -> client_data
+    - access_tokens: dict of token -> token_data
+    - refresh_tokens: dict of token -> token_data
+    - refresh_to_access: dict of refresh_token -> access_token
+    
+    Also performs cleanup of expired tokens during load.
+    
+    Returns:
+        Dict containing all OAuth session data
+    """
+    if not table_exists('system_state'):
+        return {
+            "clients": {},
+            "access_tokens": {},
+            "refresh_tokens": {},
+            "refresh_to_access": {},
+        }
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        # Load all OAuth keys
+        cur.execute("""
+            SELECT key, value FROM system_state
+            WHERE key LIKE 'oauth:%';
+        """)
+        rows = cur.fetchall()
+        
+        clients = {}
+        access_tokens = {}
+        refresh_tokens = {}
+        refresh_to_access = {}
+        expired_keys = []
+        
+        current_time = time.time()
+        
+        for key, value in rows:
+            if key.startswith("oauth:client:"):
+                client_id = key[len("oauth:client:"):]
+                clients[client_id] = value
+                
+            elif key.startswith("oauth:access_token:"):
+                # Check expiry
+                expires_at = value.get("expires_at")
+                if expires_at and expires_at < current_time:
+                    expired_keys.append(key)
+                    logger.debug(f"🧹 Found expired access token: {value.get('token', '')[:10]}...")
+                else:
+                    token = value.get("token")
+                    if token:
+                        access_tokens[token] = value
+                        
+            elif key.startswith("oauth:refresh_token:"):
+                # Check expiry
+                expires_at = value.get("expires_at")
+                if expires_at and expires_at < current_time:
+                    expired_keys.append(key)
+                    # Also mark the mapping for cleanup
+                    hash_part = key[len("oauth:refresh_token:"):]
+                    expired_keys.append(f"oauth:refresh_to_access:{hash_part}")
+                    logger.debug(f"🧹 Found expired refresh token: {value.get('token', '')[:20]}...")
+                else:
+                    token = value.get("token")
+                    if token:
+                        refresh_tokens[token] = value
+                        
+            elif key.startswith("oauth:refresh_to_access:"):
+                # Will be validated after loading refresh tokens
+                hash_part = key[len("oauth:refresh_to_access:"):]
+                access_token = value.get("access_token")
+                if access_token:
+                    # Find the refresh token that maps to this hash
+                    for rt_key, rt_val in rows:
+                        if rt_key == f"oauth:refresh_token:{hash_part}":
+                            rt = rt_val.get("token")
+                            if rt:
+                                refresh_to_access[rt] = access_token
+                            break
+        
+        # Cleanup expired tokens from database
+        if expired_keys:
+            for exp_key in expired_keys:
+                cur.execute("DELETE FROM system_state WHERE key = %s;", (exp_key,))
+            conn.commit()
+            logger.info(f"🧹 Cleaned up {len(expired_keys)} expired OAuth tokens from database")
+        
+        return {
+            "clients": clients,
+            "access_tokens": access_tokens,
+            "refresh_tokens": refresh_tokens,
+            "refresh_to_access": refresh_to_access,
+        }
+    finally:
+        cur.close()
+        conn.close()
+
+
+def cleanup_expired_oauth_sessions() -> int:
+    """
+    Clean up expired OAuth sessions from the database.
+    
+    Returns:
+        Number of expired sessions cleaned up
+    """
+    if not table_exists('system_state'):
+        return 0
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT key, value FROM system_state
+            WHERE key LIKE 'oauth:access_token:%' OR key LIKE 'oauth:refresh_token:%';
+        """)
+        rows = cur.fetchall()
+        
+        expired_keys = []
+        current_time = time.time()
+        
+        for key, value in rows:
+            expires_at = value.get("expires_at")
+            if expires_at and expires_at < current_time:
+                expired_keys.append(key)
+                # If it's a refresh token, also clean up the mapping
+                if key.startswith("oauth:refresh_token:"):
+                    hash_part = key[len("oauth:refresh_token:"):]
+                    expired_keys.append(f"oauth:refresh_to_access:{hash_part}")
+        
+        if expired_keys:
+            for exp_key in expired_keys:
+                cur.execute("DELETE FROM system_state WHERE key = %s;", (exp_key,))
+            conn.commit()
+            logger.info(f"🧹 Cleaned up {len(expired_keys)} expired OAuth tokens")
+        
+        return len(expired_keys)
     finally:
         cur.close()
         conn.close()
