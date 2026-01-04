@@ -1,6 +1,6 @@
 
 from openai import OpenAI
-from app.config import EMBEDDING_URL, EMBEDDING_MODEL, EMBEDDING_API_KEY
+from app.config import EMBEDDING_URL, EMBEDDING_MODEL, EMBEDDING_API_KEY, EMBEDDING_DIMS
 
 # Module-level cache for embedding dimension validation
 # Prevents redundant API calls on every retrieve_memories query
@@ -22,6 +22,14 @@ def get_embedding_dimension() -> int:
     
     Uses module-level caching to avoid redundant API calls on every retrieve_memories query.
     Re-validates only when EMBEDDING_MODEL changes.
+    
+    If EMBEDDING_DIMS is set:
+      - Passes dimensions parameter to API (for MRL models like Qwen)
+      - CRITICAL: Validates returned dimensions match EMBEDDING_DIMS
+      - Mismatch = startup failure (prevents wrong-sized vectors in memory_{dims} tables)
+    
+    If EMBEDDING_DIMS is not set:
+      - Uses model's native output dimensions
     """
     global _validated_embedding_model, _validated_embedding_dims
     
@@ -30,10 +38,15 @@ def get_embedding_dimension() -> int:
         return _validated_embedding_dims
     
     try:
-        response = client.embeddings.create(
-            model=EMBEDDING_MODEL,
-            input="test",
-        )
+        # Build API call - only include dimensions if EMBEDDING_DIMS is set
+        api_kwargs = {
+            "model": EMBEDDING_MODEL,
+            "input": "test",
+        }
+        if EMBEDDING_DIMS is not None:
+            api_kwargs["dimensions"] = EMBEDDING_DIMS
+        
+        response = client.embeddings.create(**api_kwargs)
         
         # Check we got data back
         if not response.data or len(response.data) == 0:
@@ -61,11 +74,23 @@ def get_embedding_dimension() -> int:
                 f"Is '{EMBEDDING_MODEL}' configured correctly?"
             )
         
+        # CRITICAL: Validate dimensions match if EMBEDDING_DIMS was specified
+        if EMBEDDING_DIMS is not None and actual_dims != EMBEDDING_DIMS:
+            raise ValueError(
+                f"EMBEDDING_DIMS={EMBEDDING_DIMS} requested but model '{EMBEDDING_MODEL}' "
+                f"returned {actual_dims} dimensions.\n"
+                f"Either remove EMBEDDING_DIMS to use native dimensions, or use an MRL-capable "
+                f"model (like Qwen) that supports the requested dimension."
+            )
+        
         # Cache the validated result
         _validated_embedding_model = EMBEDDING_MODEL
         _validated_embedding_dims = actual_dims
         
-        print(f"✓ Validated embedding model: {EMBEDDING_MODEL} ({actual_dims}D vector)")
+        if EMBEDDING_DIMS is not None:
+            print(f"✓ Validated embedding model: {EMBEDDING_MODEL} ({actual_dims}D vector, EMBEDDING_DIMS={EMBEDDING_DIMS})")
+        else:
+            print(f"✓ Validated embedding model: {EMBEDDING_MODEL} ({actual_dims}D vector)")
         return actual_dims
         
     except Exception as e:
@@ -75,12 +100,21 @@ def get_embedding_dimension() -> int:
         )
 
 def get_embedding(text: str) -> list[float]:
-    """Gets an embedding for the given text."""
+    """
+    Gets an embedding for the given text.
+    
+    If EMBEDDING_DIMS is set, passes dimensions parameter to API.
+    """
     try:
-        response = client.embeddings.create(
-            model=EMBEDDING_MODEL,
-            input=text,
-        )
+        # Build API call - only include dimensions if EMBEDDING_DIMS is set
+        api_kwargs = {
+            "model": EMBEDDING_MODEL,
+            "input": text,
+        }
+        if EMBEDDING_DIMS is not None:
+            api_kwargs["dimensions"] = EMBEDDING_DIMS
+        
+        response = client.embeddings.create(**api_kwargs)
         return response.data[0].embedding
     except Exception as e:
         raise Exception(f"Failed to get embedding: {str(e)}")

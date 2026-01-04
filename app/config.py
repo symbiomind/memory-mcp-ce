@@ -22,6 +22,12 @@ EMBEDDING_URL = os.getenv("EMBEDDING_URL")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL")
 EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY")
 
+# Optional: Request specific embedding dimensions (for MRL models like Qwen)
+# If not set, auto-detects from model's native output
+# If set, validates model returns exactly this many dimensions at startup
+_embedding_dims_raw = os.getenv("EMBEDDING_DIMS", "").strip()
+EMBEDDING_DIMS = int(_embedding_dims_raw) if _embedding_dims_raw else None
+
 # MCP Configuration
 BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 NAMESPACE = os.getenv("NAMESPACE")
