@@ -1,16 +1,17 @@
 """
-Memory MCP-CE Database Module - V4 HNSW Index Architecture
+Memory MCP-CE Database Module - V5 Key-Value System State
 
 This module handles:
 - Database connection management
 - Schema initialization (memories, system_state, memory_{dims} tables)
-- Version tracking via system_state singleton
+- Version tracking via system_state key-value store
 
 Migrations are handled by the app.migrations module.
 
-V4 Schema:
+V5 Schema:
 - HNSW indexes for unlimited embedding dimensions
 - state.embedding_tables as object structure for A/B testing
+- Flexible key-value system_state table
 """
 
 import psycopg2
@@ -74,48 +75,78 @@ def get_existing_embedding_tables() -> list[str]:
 
 
 def get_system_state() -> Optional[dict]:
-    """Get the system state from the singleton table."""
+    """
+    Get the system state as a dictionary from the key-value table.
+    
+    V5 Schema: key-value pairs are returned as a dict.
+    For backwards compatibility during migration, also handles V4 fixed-column schema.
+    
+    Returns:
+        Dict with system state values, or None if table doesn't exist
+    """
     if not table_exists('system_state'):
         return None
     
     conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur = conn.cursor()
     try:
-        cur.execute("SELECT * FROM system_state WHERE id = 1;")
-        row = cur.fetchone()
-        return dict(row) if row else None
+        # Check if this is V5 schema (has 'key' column) or V4 schema (has 'db_version' column)
+        cur.execute("""
+            SELECT column_name FROM information_schema.columns 
+            WHERE table_name = 'system_state' AND column_name = 'key';
+        """)
+        is_v5_schema = cur.fetchone() is not None
+        
+        if is_v5_schema:
+            # V5 key-value schema
+            cur.execute("SELECT key, value FROM system_state;")
+            rows = cur.fetchall()
+            if not rows:
+                return None
+            result = {}
+            for key, value in rows:
+                result[key] = value
+            return result
+        else:
+            # V4 fixed-column schema (for backwards compatibility during migration)
+            cur.execute("SELECT * FROM system_state WHERE id = 1;")
+            columns = [desc[0] for desc in cur.description]
+            row = cur.fetchone()
+            if row:
+                return dict(zip(columns, row))
+            return None
     finally:
         cur.close()
         conn.close()
 
 
-def set_system_state(db_version: int = None, jwt_state: dict = None, service_state: dict = None) -> None:
-    """Update the system state singleton."""
+def set_system_state(db_version: int = None, **kwargs) -> None:
+    """
+    Update system state key-value pairs.
+    
+    V5 Schema: each parameter becomes a key-value pair.
+    
+    Args:
+        db_version: Database version (special case for compatibility)
+        **kwargs: Any additional key-value pairs to upsert
+    """
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        # Build dynamic update
-        updates = ["updated_at = NOW()"]
-        params = []
-        
+        # Collect all key-value pairs to upsert
+        updates = {}
         if db_version is not None:
-            updates.append("db_version = %s")
-            params.append(db_version)
-            updates.append("last_migration = NOW()")
+            updates['db_version'] = db_version
+        updates.update(kwargs)
         
-        if jwt_state is not None:
-            updates.append("jwt_state = %s")
-            params.append(psycopg2.extras.Json(jwt_state))
-        
-        if service_state is not None:
-            updates.append("service_state = %s")
-            params.append(psycopg2.extras.Json(service_state))
-        
-        cur.execute(f"""
-            UPDATE system_state 
-            SET {', '.join(updates)}
-            WHERE id = 1;
-        """, params)
+        for key, value in updates.items():
+            cur.execute("""
+                INSERT INTO system_state (key, value) 
+                VALUES (%s, %s)
+                ON CONFLICT (key) DO UPDATE SET 
+                    value = EXCLUDED.value,
+                    updated_at = CURRENT_TIMESTAMP;
+            """, (key, psycopg2.extras.Json(value)))
         
         conn.commit()
     finally:
@@ -124,24 +155,39 @@ def set_system_state(db_version: int = None, jwt_state: dict = None, service_sta
 
 
 def create_system_state_table() -> None:
-    """Create the system_state singleton table."""
+    """
+    Create the V5 key-value system_state table.
+    
+    V5 Schema:
+    - id: SERIAL PRIMARY KEY
+    - key: TEXT UNIQUE NOT NULL (the setting name)
+    - value: JSONB NOT NULL (the setting value)
+    - created_at/updated_at: timestamps
+    """
+    from app.migrations.runner import CURRENT_DB_VERSION
+    
     conn = get_db_connection()
     cur = conn.cursor()
     try:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS system_state (
-                id INTEGER PRIMARY KEY DEFAULT 1,
-                db_version INTEGER NOT NULL,
-                jwt_state JSONB DEFAULT '{}'::JSONB,
-                service_state JSONB DEFAULT '{}'::JSONB,
-                last_migration TIMESTAMP,
-                created_at TIMESTAMP DEFAULT NOW(),
-                updated_at TIMESTAMP DEFAULT NOW(),
-                CHECK (id = 1)
+                id SERIAL PRIMARY KEY,
+                key TEXT UNIQUE NOT NULL,
+                value JSONB NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        
+        # Initialize with db_version
+        cur.execute("""
+            INSERT INTO system_state (key, value) 
+            VALUES ('db_version', %s)
+            ON CONFLICT (key) DO NOTHING;
+        """, (psycopg2.extras.Json(CURRENT_DB_VERSION),))
+        
         conn.commit()
-        logger.info("✅ Created system_state table")
+        logger.info("✅ Created V5 system_state table")
     finally:
         cur.close()
         conn.close()

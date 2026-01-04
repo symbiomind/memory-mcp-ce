@@ -26,6 +26,11 @@ EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY")
 BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 NAMESPACE = os.getenv("NAMESPACE")
 
+# API Configuration (separate from MCP authentication)
+# If API_BEARER_TOKEN is set, /api/* endpoints are enabled
+# If not set, /api/* endpoints return 404
+API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN")
+
 # Encryption Configuration
 # If set and non-empty, all new memories will be encrypted with AES-256-GCM
 # If empty or not set, memories are stored as plain UTF-8 (enc=false)

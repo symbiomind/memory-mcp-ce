@@ -9,7 +9,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Current database schema version
-CURRENT_DB_VERSION = 4
+CURRENT_DB_VERSION = 5
 
 
 def run_migrations(embedding_dim: int) -> None:
@@ -36,6 +36,7 @@ def run_migrations(embedding_dim: int) -> None:
     from app.migrations.v1_to_v2 import migrate_v1_to_v2, is_v1_schema
     from app.migrations.v2_to_v3 import migrate_v2_to_v3
     from app.migrations.v3_to_v4 import migrate_v3_to_v4
+    from app.migrations.v4_to_v5 import migrate_v4_to_v5
     
     # Check current database state
     system_state = get_system_state()
@@ -53,41 +54,17 @@ def run_migrations(embedding_dim: int) -> None:
                 # After V1→V2, continue with remaining migrations
                 migrate_v2_to_v3()
                 migrate_v3_to_v4()
+                migrate_v4_to_v5()
             else:
-                # Tables exist but already V2 schema (partial migration?)
-                logger.info("🔍 Tables exist with V2 schema - initializing system_state")
-                create_system_state_table()
-                conn = get_db_connection()
-                cur = conn.cursor()
-                try:
-                    cur.execute("""
-                        INSERT INTO system_state (id, db_version) 
-                        VALUES (1, %s)
-                        ON CONFLICT (id) DO UPDATE SET db_version = %s;
-                    """, (CURRENT_DB_VERSION, CURRENT_DB_VERSION))
-                    conn.commit()
-                finally:
-                    cur.close()
-                    conn.close()
+                # Tables exist but already V2+ schema (partial migration?)
+                # Run v4→v5 to create fresh V5 system_state
+                logger.info("🔍 Tables exist with V2+ schema - creating V5 system_state")
+                migrate_v4_to_v5()
         else:
-            # Fresh installation - create everything from scratch
-            logger.info("🆕 Fresh installation detected - creating V4 schema")
+            # Fresh installation - create V5 schema from scratch
+            logger.info("🆕 Fresh installation detected - creating V5 schema")
             create_system_state_table()
             create_memories_table()
-            
-            # Initialize system_state
-            conn = get_db_connection()
-            cur = conn.cursor()
-            try:
-                cur.execute("""
-                    INSERT INTO system_state (id, db_version) 
-                    VALUES (1, %s)
-                    ON CONFLICT (id) DO NOTHING;
-                """, (CURRENT_DB_VERSION,))
-                conn.commit()
-            finally:
-                cur.close()
-                conn.close()
     
     else:
         # system_state exists - check version
@@ -104,14 +81,23 @@ def run_migrations(embedding_dim: int) -> None:
                 migrate_v2_to_v3()
                 # After V2→V3, run V3→V4 as well
                 migrate_v3_to_v4()
+                # After V3→V4, run V4→V5 as well
+                migrate_v4_to_v5()
             elif current_version == 2:
                 # V2 → V3 migration (embedding_tables array → object)
                 migrate_v2_to_v3()
                 # After V2→V3, run V3→V4 as well
                 migrate_v3_to_v4()
+                # After V3→V4, run V4→V5 as well
+                migrate_v4_to_v5()
             elif current_version == 3:
                 # V3 → V4 migration (ivfflat → HNSW indexes)
                 migrate_v3_to_v4()
+                # After V3→V4, run V4→V5 as well
+                migrate_v4_to_v5()
+            elif current_version == 4:
+                # V4 → V5 migration (key-value system_state)
+                migrate_v4_to_v5()
         else:
             logger.info(f"✅ Database schema is up to date (version {current_version})")
     

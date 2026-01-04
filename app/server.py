@@ -24,6 +24,7 @@ from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 
 from app.config import (
     BEARER_TOKEN,
+    API_BEARER_TOKEN,
     SERVER_URL as config_server_url,
     OAUTH_BUNDLED,
     OAUTH_CLIENT_ID,
@@ -184,10 +185,70 @@ def create_mcp_server() -> FastMCP:
     
     logger.info(f"📁 Static file route registered: /static/*")
     
+    # Register API routes (if API_BEARER_TOKEN is set)
+    register_api_routes(mcp)
+    
     # Register tools
     register_tools(mcp)
     
     return mcp
+
+
+def register_api_routes(mcp: FastMCP) -> None:
+    """
+    Register REST API routes (separate from MCP endpoints).
+    
+    These routes are protected by API_BEARER_TOKEN (different from BEARER_TOKEN for MCP).
+    If API_BEARER_TOKEN is not set, routes return 404 as if they don't exist.
+    """
+    from starlette.responses import JSONResponse
+    from app.api.embeddings import generate_embeddings_handler
+    
+    @mcp.custom_route("/api/embeddings/generate", methods=["POST"])
+    async def api_generate_embeddings(request: Request) -> Response:
+        """
+        POST /api/embeddings/generate
+        
+        Re-embed memories with a new embedding model in the background.
+        Returns 202 Accepted immediately while processing continues in background.
+        """
+        # If API_BEARER_TOKEN not set, return 404 (API disabled)
+        if not API_BEARER_TOKEN:
+            raise HTTPException(404, "Not Found")
+        
+        # Validate Authorization header
+        auth_header = request.headers.get("Authorization")
+        if not auth_header:
+            raise HTTPException(401, "Missing Authorization header")
+        
+        if not auth_header.startswith("Bearer "):
+            raise HTTPException(401, "Invalid Authorization header format")
+        
+        token = auth_header[7:]  # Remove "Bearer " prefix
+        if token != API_BEARER_TOKEN:
+            raise HTTPException(401, "Invalid API token")
+        
+        # Parse request body
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, "Invalid JSON body")
+        
+        # Process request
+        try:
+            result = await generate_embeddings_handler(body)
+            return JSONResponse(content=result, status_code=202)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        except Exception as e:
+            logger.error(f"❌ API error: {str(e)}", exc_info=True)
+            raise HTTPException(500, f"Internal server error: {str(e)}")
+    
+    # Log API status
+    if API_BEARER_TOKEN:
+        logger.info(f"🔌 REST API enabled: POST /api/embeddings/generate")
+    else:
+        logger.info(f"🔒 REST API disabled (API_BEARER_TOKEN not set)")
 
 
 def register_tools(mcp: FastMCP) -> None:
