@@ -99,3 +99,8 @@ def _parse_timezone_config():
 
 # Parse timezone on startup
 TIMEZONE, TIMEZONE_DISABLED = _parse_timezone_config()
+
+# Performance Metrics Configuration
+# When enabled, all tool responses include timing data
+# Format: "embedding_time db_time total_time" (seconds with 3 decimal places)
+PERFORMANCE_METRICS = os.getenv("PERFORMANCE_METRICS", "false").lower() == "true"

@@ -2,7 +2,8 @@
 from app.database import get_db_connection, add_embedding_to_state, get_memory_embedding_tables
 from app.embedding import get_embedding, get_embedding_dimension
 import psycopg2.extras
-from app.config import EMBEDDING_MODEL, NAMESPACE, TIMEZONE, TIMEZONE_DISABLED
+from app.config import EMBEDDING_MODEL, NAMESPACE, TIMEZONE, TIMEZONE_DISABLED, PERFORMANCE_METRICS
+import time
 from app.encryption import (
     encrypt_content,
     is_encryption_enabled,
@@ -85,6 +86,47 @@ def add_timezone_to_response(response: dict) -> dict:
         "timezone": tz_string,
         **response
     }
+
+
+def format_performance(embedding_time: float, db_time: float, total_time: float) -> str:
+    """
+    Format performance timing as a space-separated string.
+    
+    Args:
+        embedding_time: Time spent on embedding API call (seconds)
+        db_time: Time spent on database operations (seconds)
+        total_time: Total function execution time (seconds)
+    
+    Returns:
+        String in format "0.750 0.130 1.070" (3 decimal places each)
+    """
+    return f"{embedding_time:.3f} {db_time:.3f} {total_time:.3f}"
+
+
+def add_performance_to_response(
+    response: dict,
+    embedding_time: float,
+    db_time: float,
+    total_time: float
+) -> dict:
+    """
+    Add performance timing to a response dict (if PERFORMANCE_METRICS enabled).
+    
+    Args:
+        response: The response dictionary to augment
+        embedding_time: Time spent on embedding API call (seconds)
+        db_time: Time spent on database operations (seconds)
+        total_time: Total function execution time (seconds)
+    
+    Returns:
+        Response dict with performance field added (if enabled)
+    """
+    if not PERFORMANCE_METRICS:
+        return response
+    
+    # Add performance field to response
+    response["performance"] = format_performance(embedding_time, db_time, total_time)
+    return response
 
 
 def format_time_ago(timestamp_str: str) -> str:
@@ -242,6 +284,11 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
     2. Generate embedding and insert into memory_{dims} table
     3. Update state.embedding_tables to track which tables have embeddings
     """
+    # Performance timing
+    total_start = time.time()
+    embedding_time = 0.0
+    db_time = 0.0
+    
     # Extract JSON-embedded parameters (Grok workaround)
     extracted_content, extracted_labels, extracted_source = extract_json_params(content, 'content')
     
@@ -283,11 +330,16 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
     embedding_model = EMBEDDING_MODEL
     namespace = NAMESPACE if NAMESPACE is not None else "default"
 
-    # Generate embedding
+    # Generate embedding (timed)
+    emb_start = time.time()
     embedding = get_embedding(content)
+    embedding_time = time.time() - emb_start
+    
     embedding_dim = len(embedding)
     table_name = f"memory_{embedding_dim}"
 
+    # Database operations (timed)
+    db_start = time.time()
     conn = get_db_connection()
     cur = conn.cursor()
 
@@ -358,6 +410,7 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
     conn.commit()
     cur.close()
     conn.close()
+    db_time = time.time() - db_start
 
     result = {
         "current_embedding": embedding_model,
@@ -369,7 +422,10 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
     if warnings:
         result["warnings"] = warnings
     
-    return add_timezone_to_response(result)
+    # Add performance metrics and timezone
+    total_time = time.time() - total_start
+    result = add_timezone_to_response(result)
+    return add_performance_to_response(result, embedding_time, db_time, total_time)
 
 def retrieve_memories(query: str = None, labels: str = None, source: str = None, num_results: int = 5) -> dict:
     """
@@ -389,6 +445,11 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
     7. Query + Labels + Source: Semantic search filtered by both labels AND source
     8. None (no parameters): Return most recent N memories ordered by timestamp DESC
     """
+    # Performance timing
+    total_start = time.time()
+    embedding_time = 0.0
+    db_time = 0.0
+    
     # Extract JSON-embedded parameters (Grok workaround) - only if query is provided
     if query is not None and isinstance(query, str) and query.strip():
         extracted_query, extracted_labels, extracted_source = extract_json_params(query, 'query')
@@ -414,9 +475,6 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
     embedding_model = EMBEDDING_MODEL
     namespace = NAMESPACE if NAMESPACE is not None else "default"
     
-    conn = get_db_connection()
-    cur = conn.cursor()
-    
     # Check if encryption key is available (affects which memories we can access)
     encryption_available = is_encryption_enabled()
     
@@ -427,7 +485,17 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
     # Determine which search path to use
     if query:
         # Path A: Semantic search - JOIN memories with embedding table
+        # Time the embedding call
+        emb_start = time.time()
         embedding = get_embedding(query)
+        embedding_time = time.time() - emb_start
+    
+    # Database operations (timed)
+    db_start = time.time()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    if query:
         
         # Build SQL query with JOIN to memories table
         sql = f"""
@@ -607,6 +675,7 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
     
     cur.close()
     conn.close()
+    db_time = time.time() - db_start
     
     # Build response - add current_embedding for semantic queries only
     response = {
@@ -616,7 +685,10 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
     if query:
         response = {"current_embedding": embedding_model, **response}
     
-    return add_timezone_to_response(response)
+    # Add performance metrics and timezone
+    total_time = time.time() - total_start
+    response = add_timezone_to_response(response)
+    return add_performance_to_response(response, embedding_time, db_time, total_time)
 
 def delete_memory(memory_id: int) -> dict:
     """
@@ -627,9 +699,16 @@ def delete_memory(memory_id: int) -> dict:
     2. Delete from all tracked embedding tables
     3. Delete from memories table (CASCADE handles current dimension table)
     """
+    # Performance timing
+    total_start = time.time()
+    embedding_time = 0.0  # No embedding for delete
+    db_time = 0.0
+    
     # Auto-populate from config
     namespace = NAMESPACE if NAMESPACE is not None else "default"
     
+    # Database operations (timed)
+    db_start = time.time()
     conn = get_db_connection()
     cur = conn.cursor()
     
@@ -651,10 +730,13 @@ def delete_memory(memory_id: int) -> dict:
         result = cur.fetchone()
         
         if not result:
-            return add_timezone_to_response({
+            db_time = time.time() - db_start
+            total_time = time.time() - total_start
+            response = add_timezone_to_response({
                 "success": False,
                 "error": f"❌ Memory #{memory_id} not found or access denied"
             })
+            return add_performance_to_response(response, embedding_time, db_time, total_time)
         
         # Get embedding tables from state
         # V3 format: {"embedding_tables": {"memory_384": ["model1"], "memory_768": ["model2"]}}
@@ -699,24 +781,31 @@ def delete_memory(memory_id: int) -> dict:
         
         deleted_id = cur.fetchone()
         conn.commit()
+        db_time = time.time() - db_start
+        total_time = time.time() - total_start
         
         if deleted_id:
-            return add_timezone_to_response({
+            response = add_timezone_to_response({
                 "success": True,
                 "message": f"✅ Memory #{memory_id} deleted successfully"
             })
+            return add_performance_to_response(response, embedding_time, db_time, total_time)
         else:
-            return add_timezone_to_response({
+            response = add_timezone_to_response({
                 "success": False,
                 "error": f"❌ Memory #{memory_id} not found or access denied"
             })
+            return add_performance_to_response(response, embedding_time, db_time, total_time)
     
     except Exception as e:
         conn.rollback()
-        return add_timezone_to_response({
+        db_time = time.time() - db_start
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({
             "success": False,
             "error": f"❌ Error deleting memory: {str(e)}"
         })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
     finally:
         cur.close()
         conn.close()
@@ -728,9 +817,16 @@ def get_memory(memory_id: int) -> dict:
     V2 Split-Table Architecture:
     Query memories table directly (source of truth).
     """
+    # Performance timing
+    total_start = time.time()
+    embedding_time = 0.0  # No embedding for get
+    db_time = 0.0
+    
     # Auto-populate from config
     namespace = NAMESPACE if NAMESPACE is not None else "default"
     
+    # Database operations (timed)
+    db_start = time.time()
     conn = get_db_connection()
     cur = conn.cursor()
     
@@ -760,14 +856,17 @@ def get_memory(memory_id: int) -> dict:
             # Decode or decrypt content
             content = decode_or_decrypt_content(content_bytes, is_encrypted)
             if content is None:
+                db_time = time.time() - db_start
+                total_time = time.time() - total_start
                 if is_encrypted:
-                    return add_timezone_to_response({
+                    response = add_timezone_to_response({
                         "error": f"❌ Memory #{memory_id} is encrypted and cannot be decrypted (missing or wrong key)"
                     })
                 else:
-                    return add_timezone_to_response({
+                    response = add_timezone_to_response({
                         "error": f"❌ Memory #{memory_id} content could not be decoded"
                     })
+                return add_performance_to_response(response, embedding_time, db_time, total_time)
             
             timestamp_iso = result[5].isoformat()
             memory = {
@@ -793,16 +892,25 @@ def get_memory(memory_id: int) -> dict:
                 "embedding_tables": embedding_tables
             }
             
-            return add_timezone_to_response(memory)
+            db_time = time.time() - db_start
+            total_time = time.time() - total_start
+            response = add_timezone_to_response(memory)
+            return add_performance_to_response(response, embedding_time, db_time, total_time)
         else:
-            return add_timezone_to_response({
+            db_time = time.time() - db_start
+            total_time = time.time() - total_start
+            response = add_timezone_to_response({
                 "error": f"❌ Memory #{memory_id} not found or access denied"
             })
+            return add_performance_to_response(response, embedding_time, db_time, total_time)
     
     except Exception as e:
-        return add_timezone_to_response({
+        db_time = time.time() - db_start
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({
             "error": f"❌ Error retrieving memory: {str(e)}"
         })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
     finally:
         cur.close()
         conn.close()
@@ -814,6 +922,11 @@ def random_memory(labels: str = None, source: str = None) -> dict:
     V2 Split-Table Architecture:
     Query memories table directly (source of truth).
     """
+    # Performance timing
+    total_start = time.time()
+    embedding_time = 0.0  # No embedding for random
+    db_time = 0.0
+    
     # Auto-populate from config
     namespace = NAMESPACE if NAMESPACE is not None else "default"
     
@@ -825,6 +938,8 @@ def random_memory(labels: str = None, source: str = None) -> dict:
     # Check if encryption key is available
     encryption_available = is_encryption_enabled()
     
+    # Database operations (timed)
+    db_start = time.time()
     conn = get_db_connection()
     cur = conn.cursor()
     
@@ -907,17 +1022,26 @@ def random_memory(labels: str = None, source: str = None) -> dict:
                 "embedding_tables": embedding_tables
             }
             
-            return add_timezone_to_response(memory)
+            db_time = time.time() - db_start
+            total_time = time.time() - total_start
+            response = add_timezone_to_response(memory)
+            return add_performance_to_response(response, embedding_time, db_time, total_time)
         
         # No valid memory found
-        return add_timezone_to_response({
+        db_time = time.time() - db_start
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({
             "error": "❌ No memories found matching the criteria"
         })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
     
     except Exception as e:
-        return add_timezone_to_response({
+        db_time = time.time() - db_start
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({
             "error": f"❌ Error retrieving random memory: {str(e)}"
         })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
     finally:
         cur.close()
         conn.close()
@@ -929,6 +1053,11 @@ def add_labels(memory_id: int, labels: str) -> dict:
     V2 Split-Table Architecture:
     Update memories table directly (source of truth).
     """
+    # Performance timing
+    total_start = time.time()
+    embedding_time = 0.0  # No embedding for add_labels
+    db_time = 0.0
+    
     # Auto-populate from config
     namespace = NAMESPACE if NAMESPACE is not None else "default"
     
@@ -943,11 +1072,15 @@ def add_labels(memory_id: int, labels: str) -> dict:
         new_labels = normalize_labels(labels)
     
     if not new_labels:
-        return add_timezone_to_response({
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({
             "success": False,
             "error": "❌ No valid labels provided"
         })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
     
+    # Database operations (timed)
+    db_start = time.time()
     conn = get_db_connection()
     cur = conn.cursor()
     
@@ -971,10 +1104,13 @@ def add_labels(memory_id: int, labels: str) -> dict:
         result = cur.fetchone()
         
         if not result:
-            return add_timezone_to_response({
+            db_time = time.time() - db_start
+            total_time = time.time() - total_start
+            response = add_timezone_to_response({
                 "success": False,
                 "error": f"❌ Memory #{memory_id} not found or access denied"
             })
+            return add_performance_to_response(response, embedding_time, db_time, total_time)
         
         # Parse existing labels
         existing_labels = []
@@ -995,19 +1131,25 @@ def add_labels(memory_id: int, labels: str) -> dict:
         """
         cur.execute(update_sql, (psycopg2.extras.Json(merged_labels), memory_id))
         conn.commit()
+        db_time = time.time() - db_start
+        total_time = time.time() - total_start
         
-        return add_timezone_to_response({
+        response = add_timezone_to_response({
             "success": True,
             "message": f"✅ Labels added to memory #{memory_id}",
             "labels": merged_labels
         })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
     
     except Exception as e:
         conn.rollback()
-        return add_timezone_to_response({
+        db_time = time.time() - db_start
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({
             "success": False,
             "error": f"❌ Error adding labels: {str(e)}"
         })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
     finally:
         cur.close()
         conn.close()
@@ -1019,6 +1161,11 @@ def del_labels(memory_id: int, labels: str) -> dict:
     V2 Split-Table Architecture:
     Update memories table directly (source of truth).
     """
+    # Performance timing
+    total_start = time.time()
+    embedding_time = 0.0  # No embedding for del_labels
+    db_time = 0.0
+    
     # Auto-populate from config
     namespace = NAMESPACE if NAMESPACE is not None else "default"
     
@@ -1033,11 +1180,15 @@ def del_labels(memory_id: int, labels: str) -> dict:
         labels_to_remove = normalize_labels(labels)
     
     if not labels_to_remove:
-        return add_timezone_to_response({
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({
             "success": False,
             "error": "❌ No valid labels provided"
         })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
     
+    # Database operations (timed)
+    db_start = time.time()
     conn = get_db_connection()
     cur = conn.cursor()
     
@@ -1061,10 +1212,13 @@ def del_labels(memory_id: int, labels: str) -> dict:
         result = cur.fetchone()
         
         if not result:
-            return add_timezone_to_response({
+            db_time = time.time() - db_start
+            total_time = time.time() - total_start
+            response = add_timezone_to_response({
                 "success": False,
                 "error": f"❌ Memory #{memory_id} not found or access denied"
             })
+            return add_performance_to_response(response, embedding_time, db_time, total_time)
         
         # Parse existing labels
         existing_labels = []
@@ -1083,19 +1237,25 @@ def del_labels(memory_id: int, labels: str) -> dict:
         """
         cur.execute(update_sql, (psycopg2.extras.Json(remaining_labels), memory_id))
         conn.commit()
+        db_time = time.time() - db_start
+        total_time = time.time() - total_start
         
-        return add_timezone_to_response({
+        response = add_timezone_to_response({
             "success": True,
             "message": f"✅ Labels removed from memory #{memory_id}",
             "labels": remaining_labels
         })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
     
     except Exception as e:
         conn.rollback()
-        return add_timezone_to_response({
+        db_time = time.time() - db_start
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({
             "success": False,
             "error": f"❌ Error removing labels: {str(e)}"
         })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
     finally:
         cur.close()
         conn.close()
