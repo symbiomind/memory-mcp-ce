@@ -254,7 +254,15 @@ def register_api_routes(mcp: FastMCP) -> None:
 def register_tools(mcp: FastMCP) -> None:
     """Register all MCP tools."""
     
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Store new memory",
+            "readOnlyHint": False,
+            "openWorldHint": False,
+            "destructiveHint": False,
+            "idempotentHint": False
+        }
+    )
     async def store_memory(
         content: str,
         labels: str | None = None,
@@ -273,7 +281,13 @@ def register_tools(mcp: FastMCP) -> None:
         """
         return tools.store_memory(content, labels, source)
     
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Retrieve stored memories",
+            "readOnlyHint": True,
+            "openWorldHint": False
+        }
+    )
     async def retrieve_memories(
         query: str | None = None,
         labels: str | None = None,
@@ -304,7 +318,15 @@ def register_tools(mcp: FastMCP) -> None:
         """
         return tools.retrieve_memories(query, labels, source, num_results)
     
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Add labels to a memory",
+            "readOnlyHint": False,
+            "openWorldHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True
+        }
+    )
     async def add_labels(
         memory_id: int,
         labels: str,
@@ -321,7 +343,15 @@ def register_tools(mcp: FastMCP) -> None:
         """
         return tools.add_labels(memory_id, labels)
     
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Remove labels from a memory",
+            "readOnlyHint": False,
+            "openWorldHint": False,
+            "destructiveHint": True,
+            "idempotentHint": True
+        }
+    )
     async def del_labels(
         memory_id: int,
         labels: str,
@@ -338,7 +368,15 @@ def register_tools(mcp: FastMCP) -> None:
         """
         return tools.del_labels(memory_id, labels)
     
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Delete memory by ID",
+            "readOnlyHint": False,
+            "openWorldHint": False,
+            "destructiveHint": True,
+            "idempotentHint": True
+        }
+    )
     async def delete_memory(
         memory_id: int,
     ) -> dict[str, Any]:
@@ -353,7 +391,13 @@ def register_tools(mcp: FastMCP) -> None:
         """
         return tools.delete_memory(memory_id)
     
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Get specific memory by ID",
+            "readOnlyHint": True,
+            "openWorldHint": False
+        }
+    )
     async def get_memory(
         memory_id: int,
     ) -> dict[str, Any]:
@@ -368,7 +412,13 @@ def register_tools(mcp: FastMCP) -> None:
         """
         return tools.get_memory(memory_id)
     
-    @mcp.tool()
+    @mcp.tool(
+        annotations={
+            "title": "Get a random memory",
+            "readOnlyHint": True,
+            "openWorldHint": False
+        }
+    )
     async def random_memory(
         labels: str | None = None,
         source: str | None = None,
