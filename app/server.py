@@ -435,7 +435,36 @@ def register_tools(mcp: FastMCP) -> None:
         """
         return tools.random_memory(labels, source)
     
-    logger.info(f"🛠️ Registered 7 tools: store_memory, retrieve_memories, add_labels, del_labels, delete_memory, get_memory, random_memory")
+    @mcp.tool(
+        annotations={
+            "title": "Get memory statistics",
+            "readOnlyHint": True,
+            "openWorldHint": False
+        }
+    )
+    async def memory_stats(
+        labels: str | None = None,
+        source: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Return memory statistics for the configured namespace(s).
+        
+        Three modes:
+        - No parameters: Return total memory count
+        - labels: Count memories with matching labels (fuzzy match)
+        - source: Count memories from matching source (fuzzy match)
+        
+        Args:
+            labels: Optional filter for labels (fuzzy match, comma-separated)
+            source: Optional source filter (fuzzy match)
+            
+        Returns:
+            Statistics including total count, matching count, percentage,
+            and list of matched labels/sources (labels_matched, sources_matched)
+        """
+        return tools.memory_stats(labels, source)
+    
+    logger.info(f"🛠️ Registered 8 tools: store_memory, retrieve_memories, add_labels, del_labels, delete_memory, get_memory, random_memory, memory_stats")
 
 
 def main():

@@ -1154,6 +1154,164 @@ def add_labels(memory_id: int, labels: str) -> dict:
         cur.close()
         conn.close()
 
+def memory_stats(labels: str = None, source: str = None) -> dict:
+    """
+    Return memory statistics for the configured namespace(s).
+    
+    Three modes:
+    1. No parameters: Return total memory count
+    2. labels parameter: Count memories with matching labels (fuzzy)
+    3. source parameter: Count memories from matching source (fuzzy)
+    4. labels + source: Count memories matching both filters
+    
+    Args:
+        labels: Optional filter for labels (fuzzy match, comma-separated)
+        source: Optional source filter (fuzzy match)
+        
+    Returns:
+        Statistics including total count, matching count, percentage,
+        and list of matched labels/sources
+    """
+    # Performance timing
+    total_start = time.time()
+    embedding_time = 0.0  # No embedding for stats
+    db_time = 0.0
+    
+    # Auto-populate from config
+    namespace = NAMESPACE if NAMESPACE is not None else "default"
+    
+    # Parse comma-separated labels into array
+    label_list = []
+    if labels is not None and isinstance(labels, str):
+        label_list = [t.strip() for t in labels.split(',') if t.strip()]
+    
+    # Database operations (timed)
+    db_start = time.time()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Build base WHERE clause for namespace
+        base_where = []
+        base_params = []
+        
+        if namespace:
+            base_where.append("namespace = %s")
+            base_params.append(namespace)
+        
+        base_where_sql = " WHERE " + " AND ".join(base_where) if base_where else ""
+        
+        # Get total count (always needed)
+        total_sql = f"SELECT COUNT(*) FROM memories{base_where_sql};"
+        cur.execute(total_sql, base_params)
+        total_count = cur.fetchone()[0]
+        
+        # If no filters, return simple total
+        if not label_list and not source:
+            db_time = time.time() - db_start
+            total_time = time.time() - total_start
+            response = add_timezone_to_response({
+                "total_memories": total_count
+            })
+            return add_performance_to_response(response, embedding_time, db_time, total_time)
+        
+        # Build filter conditions
+        filter_where = base_where.copy()
+        filter_params = base_params.copy()
+        
+        # Label filtering with fuzzy OR matching (same as retrieve_memories)
+        if label_list:
+            label_conditions = []
+            for label in label_list:
+                label_conditions.append(
+                    f"EXISTS (SELECT 1 FROM jsonb_array_elements_text(labels) AS label WHERE label ILIKE %s)"
+                )
+                filter_params.append(f"%{label}%")
+            
+            if label_conditions:
+                filter_where.append(f"({' OR '.join(label_conditions)})")
+        
+        # Source filtering (same as retrieve_memories)
+        if source:
+            filter_where.append("source ILIKE %s")
+            filter_params.append(f"%{source}%")
+        
+        filter_where_sql = " WHERE " + " AND ".join(filter_where) if filter_where else ""
+        
+        # Get matching count
+        match_sql = f"SELECT COUNT(*) FROM memories{filter_where_sql};"
+        cur.execute(match_sql, filter_params)
+        matching_count = cur.fetchone()[0]
+        
+        # Calculate percentage
+        if total_count > 0:
+            percentage = int((matching_count / total_count) * 100)
+        else:
+            percentage = 0
+        
+        # Build response
+        response = {
+            "matching": matching_count,
+            "total": total_count,
+            "ratio": f"{matching_count}/{total_count}",
+            "percentage": f"{percentage}%"
+        }
+        
+        # Get matched labels (distinct labels that matched the fuzzy query)
+        if label_list:
+            # Build query to find all unique labels that match any of the fuzzy patterns
+            label_match_conditions = []
+            label_match_params = base_params.copy()
+            
+            for label in label_list:
+                label_match_conditions.append("lbl ILIKE %s")
+                label_match_params.append(f"%{label}%")
+            
+            labels_sql = f"""
+                SELECT DISTINCT lbl
+                FROM memories, jsonb_array_elements_text(labels) AS lbl
+                {base_where_sql}
+                {"AND" if base_where else "WHERE"} ({' OR '.join(label_match_conditions)})
+                ORDER BY lbl;
+            """
+            cur.execute(labels_sql, label_match_params)
+            matched_labels = [row[0] for row in cur.fetchall()]
+            response["labels_matched"] = matched_labels
+        
+        # Get matched sources (distinct sources that matched the fuzzy query)
+        if source:
+            source_match_params = base_params.copy()
+            source_match_params.append(f"%{source}%")
+            
+            sources_sql = f"""
+                SELECT DISTINCT source
+                FROM memories
+                {base_where_sql}
+                {"AND" if base_where else "WHERE"} source ILIKE %s
+                ORDER BY source;
+            """
+            cur.execute(sources_sql, source_match_params)
+            matched_sources = [row[0] for row in cur.fetchall() if row[0] is not None]
+            response["sources_matched"] = matched_sources
+        
+        db_time = time.time() - db_start
+        total_time = time.time() - total_start
+        
+        response = add_timezone_to_response(response)
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
+    
+    except Exception as e:
+        db_time = time.time() - db_start
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({
+            "error": f"❌ Error getting memory stats: {str(e)}"
+        })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
+    finally:
+        cur.close()
+        conn.close()
+
+
 def del_labels(memory_id: int, labels: str) -> dict:
     """
     Remove specific labels from an existing memory (exact match, case-sensitive).
