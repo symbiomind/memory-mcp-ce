@@ -41,14 +41,14 @@ For local/trusted development, you can leave both blank. For any public-facing d
 
 ## Tested Clients
 
-- **LobeChat** ✓
+- **LibreChat** ✓
 - **Claude Desktop** ✓  
 - **CLINE (VS Code)** ✓
 - **MCP Inspector** ✓
 
 ## Application Setup
 
-1. Copy `.env.example` to `.env`
+1. Copy `.env.example` to `.env` and `docker-compose.example.yml` to `docker-compose.yml`
 2. Edit `.env` with your settings (at minimum: change `POSTGRES_PASSWORD`)
 3. Create directory `mkdir -p data` (Docker will create subdirs)
 
@@ -68,6 +68,6 @@ For local/trusted development, you can leave both blank. For any public-facing d
 
 Your MCP server is now running at `http://localhost:5005`
 
-### Client Configuration  
-Client-specific setup guides (Claude Desktop, LobeChat, MCP Inspector, CLINE)  
-will live at https://symbiomind.io/docs (coming soon).
+### SymbioMind memory-mcp-ce documentation 
+
+https://symbiomind.io/docs/memory-mcp/community-edition/
