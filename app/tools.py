@@ -195,7 +195,7 @@ def format_time_ago(timestamp_str: str) -> str:
             return f"{weeks} weeks ago"
         
         # Months (approximate: 30.44 days average)
-        months = int(days / 30.44)
+        months = round(days / 30.44)
         if months < 12:
             if months == 1:
                 return "1 month ago"
