@@ -367,7 +367,15 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
                 continue
             if similarity >= 0.70:  # 70% threshold
                 percentage = int(similarity * 100)
-                warnings.append(f"⚠️ Very similar to memory #{mem_id} ({percentage}%) - might be redundant")
+                # Tiered warning messages based on similarity level
+                if similarity >= 1.0:
+                    warnings.append(f"❌ Exact match with memory #{mem_id}")
+                elif similarity >= 0.91:
+                    warnings.append(f"⚠️ Worth reviewing for context to memory #{mem_id} ({percentage}% match)")
+                elif similarity >= 0.81:
+                    warnings.append(f"📌 Explores similar territory to memory #{mem_id} ({percentage}% match)")
+                else:  # 0.70 - 0.80
+                    warnings.append(f"ℹ️ Semantically related to memory #{mem_id} ({percentage}% match)")
     except Exception as e:
         # Table might not exist yet or be empty - that's OK for first memory
         logger.debug(f"Duplicate check skipped: {e}")
