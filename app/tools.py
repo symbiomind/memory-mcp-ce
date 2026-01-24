@@ -19,6 +19,76 @@ from datetime import datetime, timezone
 logger = logging.getLogger(__name__)
 
 
+def is_wildcard_namespace() -> bool:
+    """
+    Check if the current namespace is wildcard (empty/unset).
+    
+    Wildcard namespace means NAMESPACE env var is empty string or not set.
+    In this case, users work with real database IDs directly.
+    
+    Returns:
+        True if wildcard (no namespace restriction), False if namespaced
+    """
+    return NAMESPACE is None or NAMESPACE == ""
+
+
+def resolve_memory_id(input_id: int, namespace: str) -> tuple[int | None, str | None]:
+    """
+    Resolve user-facing ID to real database ID based on namespace mode.
+    
+    - Wildcard namespace: input_id IS the real database ID
+    - Specific namespace: input_id is content_id, need to lookup real ID
+    
+    Args:
+        input_id: The ID provided by the user
+        namespace: The namespace to search in
+        
+    Returns:
+        Tuple of (real_db_id, error_message)
+        - Success: (id, None)
+        - Not found: (None, error_message)
+    """
+    if is_wildcard_namespace():
+        # Wildcard mode - input_id is the real database ID
+        return input_id, None
+    
+    # Namespaced mode - input_id is content_id, need to find real ID
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT id FROM memories WHERE content_id = %s AND namespace = %s;",
+            (input_id, namespace)
+        )
+        result = cur.fetchone()
+        if result:
+            return result[0], None
+        else:
+            return None, f"❌ Memory #{input_id} not found in namespace"
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_display_id(real_id: int, content_id: int) -> int:
+    """
+    Get the ID to display to the user based on namespace mode.
+    
+    - Wildcard namespace: show real database ID
+    - Specific namespace: show content_id (namespace-scoped sequential ID)
+    
+    Args:
+        real_id: The actual database row ID
+        content_id: The namespace-scoped sequential ID
+        
+    Returns:
+        The appropriate ID to display to the user
+    """
+    if is_wildcard_namespace():
+        return real_id
+    return content_id
+
+
 def get_ordinal_suffix(day: int) -> str:
     """
     Get the ordinal suffix for a day number (st, nd, rd, th).
@@ -392,12 +462,20 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
         content_bytes = content.encode('utf-8')
         is_encrypted = False
     
-    # V3: Step 1 - Insert into memories table (source of truth)
+    # V6: Get next content_id for this namespace (namespace-scoped sequential numbering)
+    cur.execute(
+        """SELECT COALESCE(MAX(content_id), 0) + 1 FROM memories WHERE namespace = %s;""",
+        (namespace,)
+    )
+    next_content_id = cur.fetchone()[0]
+    
+    # V6: Step 1 - Insert into memories table (source of truth)
     # V3 structure: embedding_tables is an object mapping table names to model arrays
     cur.execute(
-        """INSERT INTO memories (content, namespace, labels, source, enc, state)
-        VALUES (%s, %s, %s, %s, %s, %s) RETURNING id;""",
+        """INSERT INTO memories (content_id, content, namespace, labels, source, enc, state)
+        VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id;""",
         (
+            next_content_id,
             content_bytes,
             namespace,
             psycopg2.extras.Json(label_list),
@@ -420,11 +498,14 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
     conn.close()
     db_time = time.time() - db_start
 
+    # Display appropriate ID based on namespace mode
+    display_id = get_display_id(memory_id, next_content_id)
+    
     result = {
         "current_embedding": embedding_model,
-        "id": memory_id,
+        "id": display_id,
         "source": source,
-        "message": f"✅ Memory stored with ID {memory_id}" + (" 🔐" if is_encrypted else "")
+        "message": f"✅ Memory stored with ID {display_id}" + (" 🔐" if is_encrypted else "")
     }
     
     if warnings:
@@ -508,7 +589,7 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
         # Build SQL query with JOIN to memories table
         sql = f"""
             SELECT m.id, m.content, e.embedding_model, m.namespace, m.labels, m.source, m.timestamp, 
-                   1 - (e.embedding <=> %s::vector) as similarity, m.enc, m.state
+                   1 - (e.embedding <=> %s::vector) as similarity, m.enc, m.state, m.content_id
             FROM memories m
             JOIN {table_name} e ON m.id = e.memory_id
         """
@@ -570,8 +651,10 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
                 continue
             
             timestamp_iso = row[6].isoformat()
+            # Display appropriate ID based on namespace mode
+            display_id = get_display_id(row[0], row[10])
             memory = {
-                "id": row[0],
+                "id": display_id,
                 "source": row[5],
                 "content": content,
                 "time": format_time_ago(timestamp_iso),
@@ -600,7 +683,7 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
         # This works regardless of embedding model changes!
         
         sql = """
-            SELECT id, content, namespace, labels, source, timestamp, enc, state
+            SELECT id, content, namespace, labels, source, timestamp, enc, state, content_id
             FROM memories
         """
         
@@ -657,8 +740,10 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
                 continue
             
             timestamp_iso = row[5].isoformat()
+            # Display appropriate ID based on namespace mode
+            display_id = get_display_id(row[0], row[8])
             memory = {
-                "id": row[0],
+                "id": display_id,
                 "source": row[4],
                 "content": content,
                 "time": format_time_ago(timestamp_iso)
@@ -706,6 +791,10 @@ def delete_memory(memory_id: int) -> dict:
     1. Get memory's state.embedding_tables to find all embedding tables
     2. Delete from all tracked embedding tables
     3. Delete from memories table (CASCADE handles current dimension table)
+    
+    V6 Namespace ID Handling:
+    - Wildcard namespace: memory_id is the real database ID
+    - Specific namespace: memory_id is content_id, resolved to real ID
     """
     # Performance timing
     total_start = time.time()
@@ -715,6 +804,22 @@ def delete_memory(memory_id: int) -> dict:
     # Auto-populate from config
     namespace = NAMESPACE if NAMESPACE is not None else "default"
     
+    # Store the user-facing ID for messages
+    user_facing_id = memory_id
+    
+    # Resolve user-facing ID to real database ID
+    real_id, error = resolve_memory_id(memory_id, namespace)
+    if error:
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({
+            "success": False,
+            "error": error
+        })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
+    
+    # Use the resolved real ID for database operations
+    memory_id = real_id
+    
     # Database operations (timed)
     db_start = time.time()
     conn = get_db_connection()
@@ -722,18 +827,13 @@ def delete_memory(memory_id: int) -> dict:
     
     try:
         # First, check if memory exists and get its state for embedding table cleanup
-        if namespace:
-            select_sql = """
-                SELECT id, state FROM memories
-                WHERE id = %s AND namespace = %s;
-            """
-            cur.execute(select_sql, (memory_id, namespace))
-        else:
-            select_sql = """
-                SELECT id, state FROM memories
-                WHERE id = %s;
-            """
-            cur.execute(select_sql, (memory_id,))
+        # Note: For wildcard namespace, we still need to verify the memory exists
+        # For namespaced mode, resolve_memory_id already verified it exists
+        select_sql = """
+            SELECT id, state FROM memories
+            WHERE id = %s;
+        """
+        cur.execute(select_sql, (memory_id,))
         
         result = cur.fetchone()
         
@@ -742,7 +842,7 @@ def delete_memory(memory_id: int) -> dict:
             total_time = time.time() - total_start
             response = add_timezone_to_response({
                 "success": False,
-                "error": f"❌ Memory #{memory_id} not found or access denied"
+                "error": f"❌ Memory #{user_facing_id} not found or access denied"
             })
             return add_performance_to_response(response, embedding_time, db_time, total_time)
         
@@ -795,13 +895,13 @@ def delete_memory(memory_id: int) -> dict:
         if deleted_id:
             response = add_timezone_to_response({
                 "success": True,
-                "message": f"✅ Memory #{memory_id} deleted successfully"
+                "message": f"✅ Memory #{user_facing_id} deleted successfully"
             })
             return add_performance_to_response(response, embedding_time, db_time, total_time)
         else:
             response = add_timezone_to_response({
                 "success": False,
-                "error": f"❌ Memory #{memory_id} not found or access denied"
+                "error": f"❌ Memory #{user_facing_id} not found or access denied"
             })
             return add_performance_to_response(response, embedding_time, db_time, total_time)
     
@@ -824,6 +924,10 @@ def get_memory(memory_id: int) -> dict:
     
     V2 Split-Table Architecture:
     Query memories table directly (source of truth).
+    
+    V6 Namespace ID Handling:
+    - Wildcard namespace: memory_id is the real database ID
+    - Specific namespace: memory_id is content_id, resolved to real ID
     """
     # Performance timing
     total_start = time.time()
@@ -833,6 +937,21 @@ def get_memory(memory_id: int) -> dict:
     # Auto-populate from config
     namespace = NAMESPACE if NAMESPACE is not None else "default"
     
+    # Store the user-facing ID for messages
+    user_facing_id = memory_id
+    
+    # Resolve user-facing ID to real database ID
+    real_id, error = resolve_memory_id(memory_id, namespace)
+    if error:
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({
+            "error": error
+        })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
+    
+    # Use the resolved real ID for database operations
+    memory_id = real_id
+    
     # Database operations (timed)
     db_start = time.time()
     conn = get_db_connection()
@@ -840,20 +959,13 @@ def get_memory(memory_id: int) -> dict:
     
     try:
         # Query memories table directly (source of truth)
-        if namespace:
-            select_sql = """
-                SELECT id, content, namespace, labels, source, timestamp, enc, state
-                FROM memories
-                WHERE id = %s AND namespace = %s;
-            """
-            cur.execute(select_sql, (memory_id, namespace))
-        else:
-            select_sql = """
-                SELECT id, content, namespace, labels, source, timestamp, enc, state
-                FROM memories
-                WHERE id = %s;
-            """
-            cur.execute(select_sql, (memory_id,))
+        # Note: resolve_memory_id already verified namespace access for namespaced mode
+        select_sql = """
+            SELECT id, content, namespace, labels, source, timestamp, enc, state, content_id
+            FROM memories
+            WHERE id = %s;
+        """
+        cur.execute(select_sql, (memory_id,))
         
         result = cur.fetchone()
         
@@ -868,17 +980,19 @@ def get_memory(memory_id: int) -> dict:
                 total_time = time.time() - total_start
                 if is_encrypted:
                     response = add_timezone_to_response({
-                        "error": f"❌ Memory #{memory_id} is encrypted and cannot be decrypted (missing or wrong key)"
+                        "error": f"❌ Memory #{user_facing_id} is encrypted and cannot be decrypted (missing or wrong key)"
                     })
                 else:
                     response = add_timezone_to_response({
-                        "error": f"❌ Memory #{memory_id} content could not be decoded"
+                        "error": f"❌ Memory #{user_facing_id} content could not be decoded"
                     })
                 return add_performance_to_response(response, embedding_time, db_time, total_time)
             
             timestamp_iso = result[5].isoformat()
+            # Display appropriate ID based on namespace mode
+            display_id = get_display_id(result[0], result[8])
             memory = {
-                "id": result[0],
+                "id": display_id,
                 "source": result[4],
                 "content": content,
                 "time": format_time_ago(timestamp_iso)
@@ -908,7 +1022,7 @@ def get_memory(memory_id: int) -> dict:
             db_time = time.time() - db_start
             total_time = time.time() - total_start
             response = add_timezone_to_response({
-                "error": f"❌ Memory #{memory_id} not found or access denied"
+                "error": f"❌ Memory #{user_facing_id} not found or access denied"
             })
             return add_performance_to_response(response, embedding_time, db_time, total_time)
     
@@ -954,7 +1068,7 @@ def random_memory(labels: str = None, source: str = None) -> dict:
     try:
         # Query memories table directly (source of truth)
         sql = """
-            SELECT id, content, namespace, labels, source, timestamp, enc, state
+            SELECT id, content, namespace, labels, source, timestamp, enc, state, content_id
             FROM memories
         """
         
@@ -1007,8 +1121,10 @@ def random_memory(labels: str = None, source: str = None) -> dict:
                 continue
             
             timestamp_iso = result[5].isoformat()
+            # Display appropriate ID based on namespace mode
+            display_id = get_display_id(result[0], result[8])
             memory = {
-                "id": result[0],
+                "id": display_id,
                 "source": result[4],
                 "content": content,
                 "time": format_time_ago(timestamp_iso)
@@ -1060,6 +1176,10 @@ def add_labels(memory_id: int, labels: str) -> dict:
     
     V2 Split-Table Architecture:
     Update memories table directly (source of truth).
+    
+    V6 Namespace ID Handling:
+    - Wildcard namespace: memory_id is the real database ID
+    - Specific namespace: memory_id is content_id, resolved to real ID
     """
     # Performance timing
     total_start = time.time()
@@ -1068,6 +1188,9 @@ def add_labels(memory_id: int, labels: str) -> dict:
     
     # Auto-populate from config
     namespace = NAMESPACE if NAMESPACE is not None else "default"
+    
+    # Store the user-facing ID for messages
+    user_facing_id = memory_id
     
     # Normalize input labels (supports both comma-separated and JSON array)
     try:
@@ -1087,6 +1210,19 @@ def add_labels(memory_id: int, labels: str) -> dict:
         })
         return add_performance_to_response(response, embedding_time, db_time, total_time)
     
+    # Resolve user-facing ID to real database ID
+    real_id, error = resolve_memory_id(memory_id, namespace)
+    if error:
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({
+            "success": False,
+            "error": error
+        })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
+    
+    # Use the resolved real ID for database operations
+    memory_id = real_id
+    
     # Database operations (timed)
     db_start = time.time()
     conn = get_db_connection()
@@ -1094,20 +1230,13 @@ def add_labels(memory_id: int, labels: str) -> dict:
     
     try:
         # Fetch existing memory from memories table (source of truth)
-        if namespace:
-            select_sql = """
-                SELECT id, labels
-                FROM memories
-                WHERE id = %s AND namespace = %s;
-            """
-            cur.execute(select_sql, (memory_id, namespace))
-        else:
-            select_sql = """
-                SELECT id, labels
-                FROM memories
-                WHERE id = %s;
-            """
-            cur.execute(select_sql, (memory_id,))
+        # Note: resolve_memory_id already verified namespace access for namespaced mode
+        select_sql = """
+            SELECT id, labels
+            FROM memories
+            WHERE id = %s;
+        """
+        cur.execute(select_sql, (memory_id,))
         
         result = cur.fetchone()
         
@@ -1116,7 +1245,7 @@ def add_labels(memory_id: int, labels: str) -> dict:
             total_time = time.time() - total_start
             response = add_timezone_to_response({
                 "success": False,
-                "error": f"❌ Memory #{memory_id} not found or access denied"
+                "error": f"❌ Memory #{user_facing_id} not found or access denied"
             })
             return add_performance_to_response(response, embedding_time, db_time, total_time)
         
@@ -1144,7 +1273,7 @@ def add_labels(memory_id: int, labels: str) -> dict:
         
         response = add_timezone_to_response({
             "success": True,
-            "message": f"✅ Labels added to memory #{memory_id}",
+            "message": f"✅ Labels added to memory #{user_facing_id}",
             "labels": merged_labels
         })
         return add_performance_to_response(response, embedding_time, db_time, total_time)
@@ -1326,6 +1455,10 @@ def del_labels(memory_id: int, labels: str) -> dict:
     
     V2 Split-Table Architecture:
     Update memories table directly (source of truth).
+    
+    V6 Namespace ID Handling:
+    - Wildcard namespace: memory_id is the real database ID
+    - Specific namespace: memory_id is content_id, resolved to real ID
     """
     # Performance timing
     total_start = time.time()
@@ -1334,6 +1467,9 @@ def del_labels(memory_id: int, labels: str) -> dict:
     
     # Auto-populate from config
     namespace = NAMESPACE if NAMESPACE is not None else "default"
+    
+    # Store the user-facing ID for messages
+    user_facing_id = memory_id
     
     # Normalize input labels (supports both comma-separated and JSON array)
     try:
@@ -1353,6 +1489,19 @@ def del_labels(memory_id: int, labels: str) -> dict:
         })
         return add_performance_to_response(response, embedding_time, db_time, total_time)
     
+    # Resolve user-facing ID to real database ID
+    real_id, error = resolve_memory_id(memory_id, namespace)
+    if error:
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({
+            "success": False,
+            "error": error
+        })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
+    
+    # Use the resolved real ID for database operations
+    memory_id = real_id
+    
     # Database operations (timed)
     db_start = time.time()
     conn = get_db_connection()
@@ -1360,20 +1509,13 @@ def del_labels(memory_id: int, labels: str) -> dict:
     
     try:
         # Fetch existing memory from memories table (source of truth)
-        if namespace:
-            select_sql = """
-                SELECT id, labels
-                FROM memories
-                WHERE id = %s AND namespace = %s;
-            """
-            cur.execute(select_sql, (memory_id, namespace))
-        else:
-            select_sql = """
-                SELECT id, labels
-                FROM memories
-                WHERE id = %s;
-            """
-            cur.execute(select_sql, (memory_id,))
+        # Note: resolve_memory_id already verified namespace access for namespaced mode
+        select_sql = """
+            SELECT id, labels
+            FROM memories
+            WHERE id = %s;
+        """
+        cur.execute(select_sql, (memory_id,))
         
         result = cur.fetchone()
         
@@ -1382,7 +1524,7 @@ def del_labels(memory_id: int, labels: str) -> dict:
             total_time = time.time() - total_start
             response = add_timezone_to_response({
                 "success": False,
-                "error": f"❌ Memory #{memory_id} not found or access denied"
+                "error": f"❌ Memory #{user_facing_id} not found or access denied"
             })
             return add_performance_to_response(response, embedding_time, db_time, total_time)
         
@@ -1408,7 +1550,7 @@ def del_labels(memory_id: int, labels: str) -> dict:
         
         response = add_timezone_to_response({
             "success": True,
-            "message": f"✅ Labels removed from memory #{memory_id}",
+            "message": f"✅ Labels removed from memory #{user_facing_id}",
             "labels": remaining_labels
         })
         return add_performance_to_response(response, embedding_time, db_time, total_time)

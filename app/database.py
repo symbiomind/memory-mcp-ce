@@ -197,13 +197,14 @@ def create_system_state_table() -> None:
 
 
 def create_memories_table() -> None:
-    """Create the main memories table (source of truth)."""
+    """Create the main memories table (source of truth) with V6 schema."""
     conn = get_db_connection()
     cur = conn.cursor()
     try:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS memories (
                 id BIGSERIAL PRIMARY KEY,
+                content_id BIGINT NOT NULL,
                 content BYTEA NOT NULL,
                 namespace VARCHAR(100) DEFAULT 'default',
                 labels JSONB DEFAULT '[]'::JSONB,
@@ -235,8 +236,14 @@ def create_memories_table() -> None:
             ON memories(timestamp DESC);
         """)
         
+        # V6: Index for efficient MAX(content_id) queries per namespace
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memories_namespace_content_id 
+            ON memories(namespace, content_id DESC);
+        """)
+        
         conn.commit()
-        logger.info("✅ Created memories table with indexes")
+        logger.info("✅ Created memories table with indexes (V6 schema)")
     finally:
         cur.close()
         conn.close()

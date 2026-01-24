@@ -9,7 +9,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Current database schema version
-CURRENT_DB_VERSION = 5
+CURRENT_DB_VERSION = 6
 
 
 def run_migrations(embedding_dim: int) -> None:
@@ -37,6 +37,7 @@ def run_migrations(embedding_dim: int) -> None:
     from app.migrations.v2_to_v3 import migrate_v2_to_v3
     from app.migrations.v3_to_v4 import migrate_v3_to_v4
     from app.migrations.v4_to_v5 import migrate_v4_to_v5
+    from app.migrations.v5_to_v6 import migrate_v5_to_v6
     
     # Check current database state
     system_state = get_system_state()
@@ -55,14 +56,16 @@ def run_migrations(embedding_dim: int) -> None:
                 migrate_v2_to_v3()
                 migrate_v3_to_v4()
                 migrate_v4_to_v5()
+                migrate_v5_to_v6()
             else:
                 # Tables exist but already V2+ schema (partial migration?)
-                # Run v4→v5 to create fresh V5 system_state
+                # Run v4→v5 to create fresh V5 system_state, then v5→v6
                 logger.info("🔍 Tables exist with V2+ schema - creating V5 system_state")
                 migrate_v4_to_v5()
+                migrate_v5_to_v6()
         else:
-            # Fresh installation - create V5 schema from scratch
-            logger.info("🆕 Fresh installation detected - creating V5 schema")
+            # Fresh installation - create V6 schema from scratch
+            logger.info("🆕 Fresh installation detected - creating V6 schema")
             create_system_state_table()
             create_memories_table()
     
@@ -83,6 +86,8 @@ def run_migrations(embedding_dim: int) -> None:
                 migrate_v3_to_v4()
                 # After V3→V4, run V4→V5 as well
                 migrate_v4_to_v5()
+                # After V4→V5, run V5→V6 as well
+                migrate_v5_to_v6()
             elif current_version == 2:
                 # V2 → V3 migration (embedding_tables array → object)
                 migrate_v2_to_v3()
@@ -90,14 +95,23 @@ def run_migrations(embedding_dim: int) -> None:
                 migrate_v3_to_v4()
                 # After V3→V4, run V4→V5 as well
                 migrate_v4_to_v5()
+                # After V4→V5, run V5→V6 as well
+                migrate_v5_to_v6()
             elif current_version == 3:
                 # V3 → V4 migration (ivfflat → HNSW indexes)
                 migrate_v3_to_v4()
                 # After V3→V4, run V4→V5 as well
                 migrate_v4_to_v5()
+                # After V4→V5, run V5→V6 as well
+                migrate_v5_to_v6()
             elif current_version == 4:
                 # V4 → V5 migration (key-value system_state)
                 migrate_v4_to_v5()
+                # After V4→V5, run V5→V6 as well
+                migrate_v5_to_v6()
+            elif current_version == 5:
+                # V5 → V6 migration (content_id for namespace-scoped numbering)
+                migrate_v5_to_v6()
         else:
             logger.info(f"✅ Database schema is up to date (version {current_version})")
     
