@@ -478,7 +478,7 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
     warnings = []
     try:
         check_sql = f"""
-            SELECT m.id, m.content, m.enc, 1 - (e.embedding <=> %s::vector) as similarity
+            SELECT m.id, m.content, m.enc, 1 - (e.embedding <=> %s::vector) as similarity, m.content_id
             FROM memories m
             JOIN {table_name} e ON m.id = e.memory_id
             WHERE e.namespace = %s AND e.embedding_model = %s
@@ -489,7 +489,7 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
         similar_memories = cur.fetchall()
         
         for row in similar_memories:
-            mem_id, mem_content_bytes, mem_enc, similarity = row
+            mem_id, mem_content_bytes, mem_enc, similarity, mem_content_id = row
             # Safely decode or decrypt content for comparison
             mem_enc = mem_enc if mem_enc is not None else False
             mem_content = decode_or_decrypt_content(bytes(mem_content_bytes), mem_enc)
@@ -498,15 +498,17 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
                 continue
             if similarity >= 0.70:  # 70% threshold
                 percentage = int(similarity * 100)
+                # Get the correct display ID for the warning message
+                display_id = get_display_id(mem_id, mem_content_id)
                 # Tiered warning messages based on similarity level
                 if similarity >= 1.0:
-                    warnings.append(f"❌ Exact match with memory #{mem_id}")
+                    warnings.append(f"❌ Exact match with memory #{display_id}")
                 elif similarity >= 0.91:
-                    warnings.append(f"⚠️ Worth reviewing for context to memory #{mem_id} ({percentage}% match)")
+                    warnings.append(f"⚠️ Worth reviewing for context to memory #{display_id} ({percentage}% match)")
                 elif similarity >= 0.81:
-                    warnings.append(f"📌 Explores similar territory to memory #{mem_id} ({percentage}% match)")
+                    warnings.append(f"📌 Explores similar territory to memory #{display_id} ({percentage}% match)")
                 else:  # 0.70 - 0.80
-                    warnings.append(f"ℹ️ Semantically related to memory #{mem_id} ({percentage}% match)")
+                    warnings.append(f"ℹ️ Semantically related to memory #{display_id} ({percentage}% match)")
     except Exception as e:
         # Table might not exist yet or be empty - that's OK for first memory
         logger.debug(f"Duplicate check skipped: {e}")
