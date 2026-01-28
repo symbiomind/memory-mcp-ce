@@ -302,6 +302,67 @@ def normalize_labels(labels_value: Any) -> List[str]:
     logger.warning(f"⚠️ Unexpected label type: {type(labels_value)}, returning empty list")
     return []
 
+
+def parse_labels_with_exclusions(labels: str | None) -> tuple[List[str], List[str]]:
+    """
+    Parse comma-separated labels into include and exclude lists.
+    Labels starting with '!' are exclusions (fuzzy NOT match).
+    
+    Args:
+        labels: Comma-separated labels string (e.g., "beer,!wine,ale,!cider")
+    
+    Returns:
+        Tuple of (include_labels, exclude_labels)
+        Example: "beer,!wine,ale" -> (["beer", "ale"], ["wine"])
+    """
+    if labels is None or not isinstance(labels, str):
+        return [], []
+    
+    include_labels = []
+    exclude_labels = []
+    
+    for label in labels.split(','):
+        label = label.strip()
+        if not label:
+            continue
+        if label.startswith('!'):
+            # Exclusion - strip the ! prefix
+            exclude_label = label[1:].strip()
+            if exclude_label:
+                exclude_labels.append(exclude_label)
+        else:
+            include_labels.append(label)
+    
+    return include_labels, exclude_labels
+
+
+def parse_source_with_exclusion(source: str | None) -> tuple[str | None, bool]:
+    """
+    Parse source parameter for exclusion prefix.
+    Source starting with '!' means exclude (fuzzy NOT match).
+    
+    Args:
+        source: Source string, optionally prefixed with '!'
+    
+    Returns:
+        Tuple of (source_value, is_exclusion)
+        Example: "!clawdbot" -> ("clawdbot", True)
+        Example: "clawdbot" -> ("clawdbot", False)
+    """
+    if source is None or not isinstance(source, str):
+        return None, False
+    
+    source = source.strip()
+    if not source:
+        return None, False
+    
+    if source.startswith('!'):
+        # Exclusion - strip the ! prefix
+        exclude_source = source[1:].strip()
+        return exclude_source if exclude_source else None, True
+    
+    return source, False
+
 def extract_json_params(param_value: str, required_key: str) -> tuple[str, str | None, str | None]:
     """
     Extract content, labels, and source from JSON-embedded parameter (Grok workaround).
@@ -552,10 +613,11 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
         # Use extracted query
         query = extracted_query
     
-    # Parse comma-separated labels into array (safely handle None)
-    label_list = []
-    if labels is not None and isinstance(labels, str):
-        label_list = [t.strip() for t in labels.split(',') if t.strip()]
+    # Parse labels with exclusion support (! prefix)
+    include_labels, exclude_labels = parse_labels_with_exclusions(labels)
+    
+    # Parse source with exclusion support (! prefix)
+    source_value, source_is_exclusion = parse_source_with_exclusion(source)
     
     # No validation required - all parameters are optional
     # When no parameters provided, returns most recent memories
@@ -610,20 +672,27 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
         if not encryption_available:
             where_clauses.append("m.enc = false")
         
-        # Label filtering on memories table with fuzzy OR matching
-        if label_list:
-            label_conditions = []
-            for label in label_list:
-                label_conditions.append(f"EXISTS (SELECT 1 FROM jsonb_array_elements_text(m.labels) AS label WHERE label ILIKE %s)")
+        # Label filtering on memories table with fuzzy matching (include/exclude)
+        # Include labels: fuzzy OR match
+        if include_labels:
+            include_conditions = []
+            for label in include_labels:
+                include_conditions.append(f"EXISTS (SELECT 1 FROM jsonb_array_elements_text(m.labels) AS label WHERE label ILIKE %s)")
                 params.append(f"%{label}%")
-            
-            if label_conditions:
-                where_clauses.append(f"({' OR '.join(label_conditions)})")
+            where_clauses.append(f"({' OR '.join(include_conditions)})")
         
-        # Source filtering on memories table
-        if source:
-            where_clauses.append("m.source ILIKE %s")
-            params.append(f"%{source}%")
+        # Exclude labels: fuzzy AND NOT match (each exclusion is separate)
+        for label in exclude_labels:
+            where_clauses.append(f"NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(m.labels) AS label WHERE label ILIKE %s)")
+            params.append(f"%{label}%")
+        
+        # Source filtering on memories table (include or exclude)
+        if source_value:
+            if source_is_exclusion:
+                where_clauses.append("NOT m.source ILIKE %s")
+            else:
+                where_clauses.append("m.source ILIKE %s")
+            params.append(f"%{source_value}%")
         
         if where_clauses:
             sql += " WHERE " + " AND ".join(where_clauses)
@@ -699,20 +768,27 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
         if not encryption_available:
             where_clauses.append("enc = false")
         
-        # Label filtering with fuzzy OR matching
-        if label_list:
-            label_conditions = []
-            for label in label_list:
-                label_conditions.append(f"EXISTS (SELECT 1 FROM jsonb_array_elements_text(labels) AS label WHERE label ILIKE %s)")
+        # Label filtering with fuzzy matching (include/exclude)
+        # Include labels: fuzzy OR match
+        if include_labels:
+            include_conditions = []
+            for label in include_labels:
+                include_conditions.append(f"EXISTS (SELECT 1 FROM jsonb_array_elements_text(labels) AS label WHERE label ILIKE %s)")
                 params.append(f"%{label}%")
-            
-            if label_conditions:
-                where_clauses.append(f"({' OR '.join(label_conditions)})")
+            where_clauses.append(f"({' OR '.join(include_conditions)})")
         
-        # Source filtering
-        if source:
-            where_clauses.append("source ILIKE %s")
-            params.append(f"%{source}%")
+        # Exclude labels: fuzzy AND NOT match (each exclusion is separate)
+        for label in exclude_labels:
+            where_clauses.append(f"NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(labels) AS label WHERE label ILIKE %s)")
+            params.append(f"%{label}%")
+        
+        # Source filtering (include or exclude)
+        if source_value:
+            if source_is_exclusion:
+                where_clauses.append("NOT source ILIKE %s")
+            else:
+                where_clauses.append("source ILIKE %s")
+            params.append(f"%{source_value}%")
         
         if where_clauses:
             sql += " WHERE " + " AND ".join(where_clauses)
@@ -1052,10 +1128,11 @@ def random_memory(labels: str = None, source: str = None) -> dict:
     # Auto-populate from config
     namespace = NAMESPACE if NAMESPACE is not None else "default"
     
-    # Parse comma-separated labels into array
-    label_list = []
-    if labels:
-        label_list = [t.strip() for t in labels.split(',') if t.strip()]
+    # Parse labels with exclusion support (! prefix)
+    include_labels, exclude_labels = parse_labels_with_exclusions(labels)
+    
+    # Parse source with exclusion support (! prefix)
+    source_value, source_is_exclusion = parse_source_with_exclusion(source)
     
     # Check if encryption key is available
     encryption_available = is_encryption_enabled()
@@ -1084,20 +1161,27 @@ def random_memory(labels: str = None, source: str = None) -> dict:
         if not encryption_available:
             where_clauses.append("enc = false")
         
-        # Label filtering with fuzzy OR matching
-        if label_list:
-            label_conditions = []
-            for label in label_list:
-                label_conditions.append(f"EXISTS (SELECT 1 FROM jsonb_array_elements_text(labels) AS label WHERE label ILIKE %s)")
+        # Label filtering with fuzzy matching (include/exclude)
+        # Include labels: fuzzy OR match
+        if include_labels:
+            include_conditions = []
+            for label in include_labels:
+                include_conditions.append(f"EXISTS (SELECT 1 FROM jsonb_array_elements_text(labels) AS label WHERE label ILIKE %s)")
                 params.append(f"%{label}%")
-            
-            if label_conditions:
-                where_clauses.append(f"({' OR '.join(label_conditions)})")
+            where_clauses.append(f"({' OR '.join(include_conditions)})")
         
-        # Source filtering with fuzzy matching
-        if source:
-            where_clauses.append("source ILIKE %s")
-            params.append(f"%{source}%")
+        # Exclude labels: fuzzy AND NOT match (each exclusion is separate)
+        for label in exclude_labels:
+            where_clauses.append(f"NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(labels) AS label WHERE label ILIKE %s)")
+            params.append(f"%{label}%")
+        
+        # Source filtering (include or exclude)
+        if source_value:
+            if source_is_exclusion:
+                where_clauses.append("NOT source ILIKE %s")
+            else:
+                where_clauses.append("source ILIKE %s")
+            params.append(f"%{source_value}%")
         
         if where_clauses:
             sql += " WHERE " + " AND ".join(where_clauses)
@@ -1302,8 +1386,8 @@ def memory_stats(labels: str = None, source: str = None) -> dict:
     4. labels + source: Count memories matching both filters
     
     Args:
-        labels: Optional filter for labels (fuzzy match, comma-separated)
-        source: Optional source filter (fuzzy match)
+        labels: Optional filter for labels (fuzzy match, comma-separated). Use ! prefix to exclude.
+        source: Optional source filter (fuzzy match). Use ! prefix to exclude.
         
     Returns:
         Statistics including total count, matching count, percentage,
@@ -1317,10 +1401,11 @@ def memory_stats(labels: str = None, source: str = None) -> dict:
     # Auto-populate from config
     namespace = NAMESPACE if NAMESPACE is not None else "default"
     
-    # Parse comma-separated labels into array
-    label_list = []
-    if labels is not None and isinstance(labels, str):
-        label_list = [t.strip() for t in labels.split(',') if t.strip()]
+    # Parse labels with exclusion support (! prefix)
+    include_labels, exclude_labels = parse_labels_with_exclusions(labels)
+    
+    # Parse source with exclusion support (! prefix)
+    source_value, source_is_exclusion = parse_source_with_exclusion(source)
     
     # Database operations (timed)
     db_start = time.time()
@@ -1344,7 +1429,7 @@ def memory_stats(labels: str = None, source: str = None) -> dict:
         total_count = cur.fetchone()[0]
         
         # If no filters, return simple total
-        if not label_list and not source:
+        if not include_labels and not exclude_labels and not source_value:
             db_time = time.time() - db_start
             total_time = time.time() - total_start
             response = add_timezone_to_response({
@@ -1356,22 +1441,31 @@ def memory_stats(labels: str = None, source: str = None) -> dict:
         filter_where = base_where.copy()
         filter_params = base_params.copy()
         
-        # Label filtering with fuzzy OR matching (same as retrieve_memories)
-        if label_list:
-            label_conditions = []
-            for label in label_list:
-                label_conditions.append(
+        # Label filtering with fuzzy matching (include/exclude)
+        # Include labels: fuzzy OR match
+        if include_labels:
+            include_conditions = []
+            for label in include_labels:
+                include_conditions.append(
                     f"EXISTS (SELECT 1 FROM jsonb_array_elements_text(labels) AS label WHERE label ILIKE %s)"
                 )
                 filter_params.append(f"%{label}%")
-            
-            if label_conditions:
-                filter_where.append(f"({' OR '.join(label_conditions)})")
+            filter_where.append(f"({' OR '.join(include_conditions)})")
         
-        # Source filtering (same as retrieve_memories)
-        if source:
-            filter_where.append("source ILIKE %s")
-            filter_params.append(f"%{source}%")
+        # Exclude labels: fuzzy AND NOT match (each exclusion is separate)
+        for label in exclude_labels:
+            filter_where.append(
+                f"NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(labels) AS label WHERE label ILIKE %s)"
+            )
+            filter_params.append(f"%{label}%")
+        
+        # Source filtering (include or exclude)
+        if source_value:
+            if source_is_exclusion:
+                filter_where.append("NOT source ILIKE %s")
+            else:
+                filter_where.append("source ILIKE %s")
+            filter_params.append(f"%{source_value}%")
         
         filter_where_sql = " WHERE " + " AND ".join(filter_where) if filter_where else ""
         
@@ -1395,12 +1489,13 @@ def memory_stats(labels: str = None, source: str = None) -> dict:
         }
         
         # Get matched labels (distinct labels that matched the fuzzy query)
-        if label_list:
+        # Only show for include labels (exclusions don't have "matched" labels)
+        if include_labels:
             # Build query to find all unique labels that match any of the fuzzy patterns
             label_match_conditions = []
             label_match_params = base_params.copy()
             
-            for label in label_list:
+            for label in include_labels:
                 label_match_conditions.append("lbl ILIKE %s")
                 label_match_params.append(f"%{label}%")
             
@@ -1416,9 +1511,10 @@ def memory_stats(labels: str = None, source: str = None) -> dict:
             response["labels_matched"] = matched_labels
         
         # Get matched sources (distinct sources that matched the fuzzy query)
-        if source:
+        # Only show for include source (exclusions don't have "matched" sources)
+        if source_value and not source_is_exclusion:
             source_match_params = base_params.copy()
-            source_match_params.append(f"%{source}%")
+            source_match_params.append(f"%{source_value}%")
             
             sources_sql = f"""
                 SELECT DISTINCT source

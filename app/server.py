@@ -309,8 +309,8 @@ def register_tools(mcp: FastMCP) -> None:
         
         Args:
             query: Optional query text for semantic search (uses embeddings)
-            labels: Optional comma-separated labels for filtering (fuzzy match)
-            source: Optional source filter (fuzzy match)
+            labels: Optional comma-separated labels for filtering (fuzzy match). Use ! prefix to exclude (e.g., 'beer,!wine')
+            source: Optional source filter (fuzzy match). Use ! prefix to exclude (e.g., '!clawdbot')
             num_results: Number of results to return (default: 5)
             
         Returns:
@@ -427,8 +427,8 @@ def register_tools(mcp: FastMCP) -> None:
         Retrieve a random memory from the namespace.
         
         Args:
-            labels: Optional comma-separated labels for filtering
-            source: Optional source filter using fuzzy matching
+            labels: Optional comma-separated labels for filtering (fuzzy match). Use ! prefix to exclude (e.g., 'beer,!wine')
+            source: Optional source filter (fuzzy match). Use ! prefix to exclude (e.g., '!clawdbot')
             
         Returns:
             A random memory matching the filters
@@ -455,8 +455,8 @@ def register_tools(mcp: FastMCP) -> None:
         - source: Count memories from matching source (fuzzy match)
         
         Args:
-            labels: Optional filter for labels (fuzzy match, comma-separated)
-            source: Optional source filter (fuzzy match)
+            labels: Optional filter for labels (fuzzy match, comma-separated). Use ! prefix to exclude (e.g., 'beer,!wine')
+            source: Optional source filter (fuzzy match). Use ! prefix to exclude (e.g., '!clawdbot')
             
         Returns:
             Statistics including total count, matching count, percentage,
