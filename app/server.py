@@ -464,7 +464,37 @@ def register_tools(mcp: FastMCP) -> None:
         """
         return tools.memory_stats(labels, source)
     
-    logger.info(f"🛠️ Registered 8 tools: store_memory, retrieve_memories, add_labels, del_labels, delete_memory, get_memory, random_memory, memory_stats")
+    @mcp.tool(
+        annotations={
+            "title": "Get trending labels",
+            "readOnlyHint": True,
+            "openWorldHint": False
+        }
+    )
+    async def trending_labels(
+        days: int = 30,
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        """
+        Get currently trending labels based on token activity and synaptic decay model.
+        
+        Uses a two-stage algorithm:
+        1. Find hot tokens from recent label activity with decay calculation
+        2. Match tokens to actual labels in current memories
+        
+        The synaptic decay model means heavily-used topics stay relevant longer,
+        while rarely-used tokens fade quickly (mimics neural pathway strengthening).
+        
+        Args:
+            days: Time window for considering tokens (hard cutoff, default: 30)
+            limit: Maximum number of trending labels to return (default: 10)
+            
+        Returns:
+            List of trending labels with counts and the top matching token
+        """
+        return tools.trending_labels(days, limit)
+    
+    logger.info(f"🛠️ Registered 9 tools: store_memory, retrieve_memories, add_labels, del_labels, delete_memory, get_memory, random_memory, memory_stats, trending_labels")
 
 
 def main():

@@ -1,7 +1,7 @@
 
 from app.database import get_db_connection, add_embedding_to_state, get_memory_embedding_tables
 from app.embedding import get_embedding, get_embedding_dimension
-from app.utils import tokenize_labels
+from app.utils import tokenize_labels, update_label_token_popularity
 import psycopg2.extras
 from app.config import EMBEDDING_MODEL, NAMESPACE, TIMEZONE, TIMEZONE_DISABLED, PERFORMANCE_METRICS
 import time
@@ -562,37 +562,17 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
     conn.close()
     db_time = time.time() - db_start
 
-    # Track label token popularity (only if labels exist)
+    # Track label token popularity (fire-and-forget)
     # This runs AFTER memory is committed - token tracking failure won't affect memory storage
     if label_list:
-        token_counts = tokenize_labels(label_list)
-        
-        if token_counts:
-            try:
-                conn = get_db_connection()
-                cur = conn.cursor()
-                
-                # Batch upsert using unnest() - single query for all tokens
-                tokens = list(token_counts.keys())
-                counts = list(token_counts.values())
-                namespaces = [namespace] * len(tokens)
-                
-                cur.execute("""
-                    INSERT INTO label_tokens (namespace, token, count, last_seen)
-                    SELECT unnest(%s::varchar[]), unnest(%s::varchar[]), unnest(%s::int[]), NOW()
-                    ON CONFLICT (namespace, token) 
-                    DO UPDATE SET 
-                        count = label_tokens.count + EXCLUDED.count,
-                        last_seen = NOW()
-                """, (namespaces, tokens, counts))
-                conn.commit()
-                logger.debug(f"📊 Tracked {len(tokens)} label tokens for memory")
-            except Exception as e:
-                # Don't fail the whole operation - memory was already stored successfully
-                logger.warning(f"⚠️ Failed to track label tokens: {e}")
-            finally:
-                cur.close()
-                conn.close()
+        try:
+            conn = get_db_connection()
+            update_label_token_popularity(namespace, label_list, conn)
+            conn.commit()
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to track label tokens: {e}")
+        finally:
+            conn.close()
 
     # Display appropriate ID based on namespace mode
     display_id = get_display_id(memory_id, next_content_id)
@@ -881,6 +861,23 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
     conn.close()
     db_time = time.time() - db_start
     
+    # Track label token popularity for all returned memories (fire-and-forget)
+    # Flatten all labels from all returned memories into a single list
+    all_labels = []
+    for memory in memories:
+        if "labels" in memory:
+            all_labels.extend(memory["labels"])
+    
+    if all_labels:
+        try:
+            conn = get_db_connection()
+            update_label_token_popularity(namespace, all_labels, conn)
+            conn.commit()
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to track label tokens from retrieve: {e}")
+        finally:
+            conn.close()
+    
     # Build response - add current_embedding for semantic queries only
     response = {
         "memories": memories,
@@ -1126,6 +1123,18 @@ def get_memory(memory_id: int) -> dict:
             }
             
             db_time = time.time() - db_start
+            
+            # Track label token popularity for this memory (fire-and-forget)
+            if "labels" in memory and memory["labels"]:
+                try:
+                    track_conn = get_db_connection()
+                    update_label_token_popularity(namespace, memory["labels"], track_conn)
+                    track_conn.commit()
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to track label tokens from get_memory: {e}")
+                finally:
+                    track_conn.close()
+            
             total_time = time.time() - total_start
             response = add_timezone_to_response(memory)
             return add_performance_to_response(response, embedding_time, db_time, total_time)
@@ -1573,6 +1582,168 @@ def memory_stats(labels: str = None, source: str = None) -> dict:
         total_time = time.time() - total_start
         response = add_timezone_to_response({
             "error": f"❌ Error getting memory stats: {str(e)}"
+        })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
+    finally:
+        cur.close()
+        conn.close()
+
+
+def trending_labels(days: int = 30, limit: int = 10) -> dict:
+    """
+    Get currently trending labels based on token activity and synaptic decay model.
+    
+    Two-stage algorithm:
+    1. Get hot tokens from label_tokens table with decay calculation
+    2. Fuzzy search memories for actual labels containing those tokens
+    
+    The synaptic decay model means heavily-used topics stay relevant longer,
+    while rarely-used tokens fade quickly. This mimics how neural pathways
+    strengthen with use.
+    
+    Args:
+        days: Time window for considering tokens (hard cutoff, default 30)
+        limit: Maximum number of trending labels to return (default 10)
+        
+    Returns:
+        Dict with trending_labels array and time_window_days
+    """
+    # Performance timing
+    total_start = time.time()
+    embedding_time = 0.0  # No embedding for trending_labels
+    db_time = 0.0
+    
+    # Auto-populate from config
+    namespace = NAMESPACE if NAMESPACE is not None else "default"
+    
+    # Database operations (timed)
+    db_start = time.time()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Stage 1: Get hot tokens with synaptic decay
+        # Decay formula: count * POW(0.9, days_since_last_seen)
+        # This means ~10% decay per day of inactivity
+        stage1_sql = """
+            SELECT 
+                token,
+                count * POW(0.9, EXTRACT(DAY FROM NOW() - last_seen)) as decayed_count
+            FROM label_tokens
+            WHERE namespace = %s AND last_seen > NOW() - INTERVAL '%s days'
+            ORDER BY decayed_count DESC
+            LIMIT 20;
+        """
+        cur.execute(stage1_sql, (namespace, days))
+        hot_tokens = cur.fetchall()
+        
+        # Edge case: No tokens in time window
+        if not hot_tokens:
+            db_time = time.time() - db_start
+            total_time = time.time() - total_start
+            response = add_timezone_to_response({
+                "trending_labels": [],
+                "time_window_days": days
+            })
+            return add_performance_to_response(response, embedding_time, db_time, total_time)
+        
+        # Build token list and map for tracking which token matched each label
+        tokens = [row[0] for row in hot_tokens]
+        token_scores = {row[0]: row[1] for row in hot_tokens}
+        
+        # Stage 2: Find actual labels containing these tokens
+        # Build fuzzy OR query for labels
+        label_conditions = []
+        label_params = [namespace]
+        
+        for token in tokens:
+            label_conditions.append(
+                "EXISTS (SELECT 1 FROM jsonb_array_elements_text(labels) AS lbl WHERE lbl ILIKE %s)"
+            )
+            label_params.append(f"%{token}%")
+        
+        # Add time window filter (same days parameter)
+        stage2_sql = f"""
+            SELECT labels
+            FROM memories
+            WHERE namespace = %s 
+            AND timestamp > NOW() - INTERVAL '{days} days'
+            AND ({' OR '.join(label_conditions)});
+        """
+        cur.execute(stage2_sql, label_params)
+        memory_rows = cur.fetchall()
+        
+        # Edge case: Tokens exist but no matching memories (orphaned tokens)
+        if not memory_rows:
+            db_time = time.time() - db_start
+            total_time = time.time() - total_start
+            response = add_timezone_to_response({
+                "trending_labels": [],
+                "time_window_days": days
+            })
+            return add_performance_to_response(response, embedding_time, db_time, total_time)
+        
+        # Count frequency of each FULL label and track which hot token matched it
+        label_counts: dict[str, int] = {}
+        label_top_token: dict[str, str] = {}
+        
+        for row in memory_rows:
+            labels_data = row[0]
+            if not labels_data:
+                continue
+            
+            # Handle both list and JSON string formats
+            if isinstance(labels_data, list):
+                memory_labels = labels_data
+            else:
+                try:
+                    memory_labels = json.loads(labels_data)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+            
+            for label in memory_labels:
+                label_lower = label.lower()
+                
+                # Check which hot token(s) this label matches
+                for token in tokens:
+                    if token.lower() in label_lower:
+                        # Count this label
+                        label_counts[label] = label_counts.get(label, 0) + 1
+                        
+                        # Track the highest-scoring token that matched this label
+                        if label not in label_top_token:
+                            label_top_token[label] = token
+                        elif token_scores.get(token, 0) > token_scores.get(label_top_token[label], 0):
+                            label_top_token[label] = token
+                        
+                        break  # Only count each label once per memory
+        
+        # Sort by frequency and take top N
+        sorted_labels = sorted(label_counts.items(), key=lambda x: x[1], reverse=True)[:limit]
+        
+        # Build response
+        trending = []
+        for label, count in sorted_labels:
+            trending.append({
+                "label": label,
+                "count": count,
+                "top_token": label_top_token.get(label, "")
+            })
+        
+        db_time = time.time() - db_start
+        total_time = time.time() - total_start
+        
+        response = add_timezone_to_response({
+            "trending_labels": trending,
+            "time_window_days": days
+        })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
+    
+    except Exception as e:
+        db_time = time.time() - db_start
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({
+            "error": f"❌ Error getting trending labels: {str(e)}"
         })
         return add_performance_to_response(response, embedding_time, db_time, total_time)
     finally:
