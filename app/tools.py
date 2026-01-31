@@ -20,6 +20,275 @@ from datetime import datetime, timezone
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# Related Memories Helper Functions
+# =============================================================================
+
+def format_related_for_display(related: list, cur) -> list:
+    """
+    Format related memories for display output.
+    
+    Converts internal storage format (real DB IDs, decimal similarity) to
+    user-friendly display format (display IDs, percentage similarity).
+    
+    Args:
+        related: List of related memory dicts from state.related
+        cur: Database cursor for looking up content_ids
+        
+    Returns:
+        List of formatted related memory dicts for output
+    """
+    if not related:
+        return []
+    
+    result = []
+    for rel in related:
+        real_id = rel.get('id')
+        if not real_id:
+            continue
+            
+        # Look up content_id for this real_id to get display_id
+        cur.execute("SELECT content_id FROM memories WHERE id = %s", (real_id,))
+        row = cur.fetchone()
+        if row:
+            display_id = get_display_id(real_id, row[0])
+            result.append({
+                "id": display_id,
+                "similarity": f"{int(rel.get('similarity', 0) * 100)}%",
+                "shared_labels": rel.get('shared_labels', [])
+            })
+    return result
+
+
+def update_related_backlinks(new_memory_id: int, new_content_id: int, new_labels: list, 
+                              related_memories: list, namespace: str, cur, conn) -> None:
+    """
+    Fire-and-forget: Add backlinks from related memories to the new memory.
+    
+    When memory A is stored and finds memories B and C as related,
+    this function updates B and C to include A in their related arrays.
+    
+    Args:
+        new_memory_id: Real DB ID of the newly stored memory
+        new_content_id: Content ID of the newly stored memory
+        new_labels: Labels of the newly stored memory
+        related_memories: List of related memory dicts (with id, similarity, shared_labels)
+        namespace: Current namespace
+        cur: Database cursor
+        conn: Database connection
+    """
+    if not related_memories:
+        return
+    
+    try:
+        for rel in related_memories:
+            related_id = rel.get('id')
+            if not related_id:
+                continue
+            
+            # Fetch the related memory's current state and labels
+            cur.execute(
+                "SELECT state, labels FROM memories WHERE id = %s AND namespace = %s",
+                (related_id, namespace)
+            )
+            row = cur.fetchone()
+            if not row:
+                continue
+            
+            current_state = row[0] if row[0] else {}
+            related_labels = row[1] if row[1] else []
+            if isinstance(related_labels, str):
+                related_labels = json.loads(related_labels)
+            
+            # Calculate shared labels from the related memory's perspective
+            shared_labels = list(set(new_labels) & set(related_labels))
+            
+            # Build backlink entry
+            backlink = {
+                "id": new_memory_id,
+                "similarity": rel.get('similarity', 0),
+                "shared_labels": shared_labels
+            }
+            
+            # Get existing related array or create new one
+            existing_related = current_state.get('related', [])
+            
+            # Check if backlink already exists (shouldn't, but be safe)
+            if not any(r.get('id') == new_memory_id for r in existing_related):
+                existing_related.append(backlink)
+                
+                # Keep only top entries to prevent explosion (optional: could limit to 10)
+                # For now, let it grow - old memories accumulate connections
+                
+                current_state['related'] = existing_related
+                
+                # Update the related memory's state
+                cur.execute(
+                    "UPDATE memories SET state = %s WHERE id = %s",
+                    (psycopg2.extras.Json(current_state), related_id)
+                )
+        
+        conn.commit()
+        logger.debug(f"🔗 Added backlinks to {len(related_memories)} related memories")
+        
+    except Exception as e:
+        # Fire-and-forget - log warning but don't fail
+        logger.warning(f"⚠️ Failed to update related backlinks: {e}")
+        try:
+            conn.rollback()
+        except:
+            pass
+
+
+def cleanup_related_on_delete(memory_id: int, namespace: str, cur, conn) -> None:
+    """
+    Remove deleted memory from all related arrays that reference it.
+    
+    When a memory is deleted, find all memories that have it in their
+    state.related array and remove that entry.
+    
+    Args:
+        memory_id: Real DB ID of the memory being deleted
+        namespace: Current namespace
+        cur: Database cursor
+        conn: Database connection
+    """
+    try:
+        # Find all memories that reference this memory in their related array
+        # JSONB containment query: state->'related' contains an object with this id
+        cur.execute("""
+            SELECT id, state FROM memories 
+            WHERE namespace = %s 
+            AND state->'related' @> %s::jsonb
+        """, (namespace, json.dumps([{"id": memory_id}])))
+        
+        referencing_memories = cur.fetchall()
+        
+        if not referencing_memories:
+            return
+        
+        for ref_id, ref_state in referencing_memories:
+            if not ref_state:
+                continue
+                
+            existing_related = ref_state.get('related', [])
+            
+            # Remove the entry for the deleted memory
+            new_related = [r for r in existing_related if r.get('id') != memory_id]
+            
+            ref_state['related'] = new_related
+            
+            # Update the memory's state
+            cur.execute(
+                "UPDATE memories SET state = %s WHERE id = %s",
+                (psycopg2.extras.Json(ref_state), ref_id)
+            )
+        
+        logger.debug(f"🧹 Cleaned up related references from {len(referencing_memories)} memories")
+        
+    except Exception as e:
+        # Log warning but don't fail the delete operation
+        logger.warning(f"⚠️ Failed to cleanup related references: {e}")
+
+
+def cleanup_shared_labels_on_del(memory_id: int, labels_removed: list, namespace: str, cur, conn) -> None:
+    """
+    Update shared_labels BIDIRECTIONALLY after label deletion.
+    
+    When labels are removed from a memory, we need to update shared_labels in TWO directions:
+    1. Memories that REFERENCE this memory (their state.related entries pointing to memory_id)
+    2. This memory's OWN relations (its state.related entries pointing to other memories)
+    
+    Args:
+        memory_id: Real DB ID of the memory whose labels were removed
+        labels_removed: List of labels that were removed
+        namespace: Current namespace
+        cur: Database cursor
+        conn: Database connection
+    """
+    if not labels_removed:
+        return
+    
+    try:
+        labels_removed_set = set(labels_removed)
+        updated_count = 0
+        
+        # === DIRECTION 1: Update memories that REFERENCE this memory ===
+        # Find all memories that have memory_id in their state.related array
+        cur.execute("""
+            SELECT id, state FROM memories 
+            WHERE namespace = %s 
+            AND state->'related' @> %s::jsonb
+        """, (namespace, json.dumps([{"id": memory_id}])))
+        
+        referencing_memories = cur.fetchall()
+        
+        for ref_id, ref_state in referencing_memories:
+            if not ref_state:
+                continue
+                
+            existing_related = ref_state.get('related', [])
+            updated = False
+            
+            for rel in existing_related:
+                if rel.get('id') == memory_id:
+                    # Remove the deleted labels from shared_labels
+                    current_shared = rel.get('shared_labels', [])
+                    new_shared = [l for l in current_shared if l not in labels_removed_set]
+                    rel['shared_labels'] = new_shared
+                    updated = True
+                    break
+            
+            if updated:
+                ref_state['related'] = existing_related
+                cur.execute(
+                    "UPDATE memories SET state = %s WHERE id = %s",
+                    (psycopg2.extras.Json(ref_state), ref_id)
+                )
+                updated_count += 1
+        
+        # === DIRECTION 2: Update THIS memory's own relations ===
+        # The target memory's state.related entries also have shared_labels that need updating
+        cur.execute("""
+            SELECT state FROM memories 
+            WHERE id = %s AND namespace = %s
+        """, (memory_id, namespace))
+        
+        result = cur.fetchone()
+        if result and result[0]:
+            target_state = result[0]
+            target_related = target_state.get('related', [])
+            target_updated = False
+            
+            for rel in target_related:
+                current_shared = rel.get('shared_labels', [])
+                new_shared = [l for l in current_shared if l not in labels_removed_set]
+                if len(new_shared) != len(current_shared):
+                    rel['shared_labels'] = new_shared
+                    target_updated = True
+            
+            if target_updated:
+                target_state['related'] = target_related
+                cur.execute(
+                    "UPDATE memories SET state = %s WHERE id = %s",
+                    (psycopg2.extras.Json(target_state), memory_id)
+                )
+                updated_count += 1
+        
+        # Commit the shared_labels updates (fire-and-forget pattern)
+        if updated_count > 0:
+            conn.commit()
+            logger.debug(f"🏷️ Updated shared_labels bidirectionally in {updated_count} memories")
+        
+    except Exception as e:
+        # Log warning but don't fail the del_labels operation
+        logger.warning(f"⚠️ Failed to cleanup shared_labels: {e}")
+        try:
+            conn.rollback()
+        except:
+            pass
+
+
 def is_wildcard_namespace() -> bool:
     """
     Check if the current namespace is wildcard (empty/unset).
@@ -476,10 +745,12 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
     cur = conn.cursor()
 
     # Check for similar memories (duplicate detection) - query embedding table with JOIN to memories
+    # Also capture top 2 for related_memories feature
     warnings = []
+    related_memories_data = []  # For storing in state.related
     try:
         check_sql = f"""
-            SELECT m.id, m.content, m.enc, 1 - (e.embedding <=> %s::vector) as similarity, m.content_id
+            SELECT m.id, m.content, m.enc, 1 - (e.embedding <=> %s::vector) as similarity, m.content_id, m.labels
             FROM memories m
             JOIN {table_name} e ON m.id = e.memory_id
             WHERE e.namespace = %s AND e.embedding_model = %s
@@ -490,7 +761,7 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
         similar_memories = cur.fetchall()
         
         for row in similar_memories:
-            mem_id, mem_content_bytes, mem_enc, similarity, mem_content_id = row
+            mem_id, mem_content_bytes, mem_enc, similarity, mem_content_id, mem_labels = row
             # Safely decode or decrypt content for comparison
             mem_enc = mem_enc if mem_enc is not None else False
             mem_content = decode_or_decrypt_content(bytes(mem_content_bytes), mem_enc)
@@ -510,6 +781,21 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
                     warnings.append(f"📌 Explores similar territory to memory #{display_id} ({percentage}% match)")
                 else:  # 0.70 - 0.80
                     warnings.append(f"ℹ️ Semantically related to memory #{display_id} ({percentage}% match)")
+                
+                # Capture for related_memories (top 2 with ≥70% similarity)
+                # Parse related memory's labels for shared_labels calculation
+                related_labels = []
+                if mem_labels:
+                    related_labels = mem_labels if isinstance(mem_labels, list) else json.loads(mem_labels)
+                
+                # Calculate shared labels (exact intersection)
+                shared_labels = list(set(label_list) & set(related_labels))
+                
+                related_memories_data.append({
+                    "id": mem_id,  # Real DB ID for storage
+                    "similarity": round(similarity, 4),
+                    "shared_labels": shared_labels
+                })
     except Exception as e:
         # Table might not exist yet or be empty - that's OK for first memory
         logger.debug(f"Duplicate check skipped: {e}")
@@ -535,6 +821,11 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
     
     # V6: Step 1 - Insert into memories table (source of truth)
     # V3 structure: embedding_tables is an object mapping table names to model arrays
+    # V8: Include related memories in state if any were found
+    initial_state = {'embedding_tables': {table_name: [embedding_model]}}
+    if related_memories_data:
+        initial_state['related'] = related_memories_data
+    
     cur.execute(
         """INSERT INTO memories (content_id, content, namespace, labels, source, enc, state)
         VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id;""",
@@ -545,7 +836,7 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
             psycopg2.extras.Json(label_list),
             source,
             is_encrypted,
-            psycopg2.extras.Json({'embedding_tables': {table_name: [embedding_model]}})
+            psycopg2.extras.Json(initial_state)
         )
     )
     memory_id = cur.fetchone()[0]
@@ -573,6 +864,23 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
             logger.warning(f"⚠️ Failed to track label tokens: {e}")
         finally:
             conn.close()
+    
+    # V8: Update related memories with backlinks (fire-and-forget)
+    # This creates bidirectional connections - old memories accumulate links over time
+    if related_memories_data:
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            update_related_backlinks(memory_id, next_content_id, label_list, 
+                                     related_memories_data, namespace, cur, conn)
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to update related backlinks: {e}")
+        finally:
+            try:
+                cur.close()
+                conn.close()
+            except:
+                pass
 
     # Display appropriate ID based on namespace mode
     display_id = get_display_id(memory_id, next_content_id)
@@ -752,6 +1060,11 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
             state = row[9] if row[9] else {}
             embedding_tables = state.get('embedding_tables', {})
             
+            # V8: Add related_memories if present (below labels, above meta)
+            related = state.get('related', [])
+            if related:
+                memory["related_memories"] = format_related_for_display(related, cur)
+            
             memory["meta"] = {
                 "timestamp": timestamp_iso,
                 "embedding_model": row[2],
@@ -846,6 +1159,11 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
             # Get embedding_tables from state
             state = row[7] if row[7] else {}
             embedding_tables = state.get('embedding_tables', {})
+            
+            # V8: Add related_memories if present (below labels, above meta)
+            related = state.get('related', [])
+            if related:
+                memory["related_memories"] = format_related_for_display(related, cur)
             
             # For non-semantic queries, we don't have embedding info from the query
             memory["meta"] = {
@@ -978,6 +1296,10 @@ def delete_memory(memory_id: int) -> dict:
             except Exception as e:
                 # Table might not exist anymore - that's OK
                 logger.debug(f"Could not delete from {table_name}: {e}")
+        
+        # V8: Cleanup related references - remove this memory from other memories' related arrays
+        # This is done BEFORE deleting the memory so we can still find references
+        cleanup_related_on_delete(memory_id, namespace, cur, conn)
         
         # Delete from memories table
         if namespace:
@@ -1113,6 +1435,11 @@ def get_memory(memory_id: int) -> dict:
             # Get embedding info from state
             state = result[7] if result[7] else {}
             embedding_tables = state.get('embedding_tables', {})
+            
+            # V8: Add related_memories if present (below labels, above meta)
+            related = state.get('related', [])
+            if related:
+                memory["related_memories"] = format_related_for_display(related, cur)
             
             # Add meta
             memory["meta"] = {
@@ -1265,6 +1592,11 @@ def random_memory(labels: str = None, source: str = None) -> dict:
             # Get embedding_tables from state
             state = result[7] if result[7] else {}
             embedding_tables = state.get('embedding_tables', {})
+            
+            # V8: Add related_memories if present (below labels, above meta)
+            related = state.get('related', [])
+            if related:
+                memory["related_memories"] = format_related_for_display(related, cur)
             
             # Add meta
             memory["meta"] = {
@@ -1847,6 +2179,11 @@ def del_labels(memory_id: int, labels: str) -> dict:
         """
         cur.execute(update_sql, (psycopg2.extras.Json(remaining_labels), memory_id))
         conn.commit()
+        
+        # V8: Cleanup shared_labels in memories that reference this one
+        # Remove the deleted labels from their shared_labels arrays
+        cleanup_shared_labels_on_del(memory_id, labels_to_remove, namespace, cur, conn)
+        
         db_time = time.time() - db_start
         total_time = time.time() - total_start
         
