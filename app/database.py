@@ -249,6 +249,41 @@ def create_memories_table() -> None:
         conn.close()
 
 
+def create_label_tokens_table() -> None:
+    """Create the label_tokens table for trending labels feature (V7 schema)."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS label_tokens (
+                namespace VARCHAR(100) DEFAULT 'default',
+                token VARCHAR(255) NOT NULL,
+                count INTEGER DEFAULT 0,
+                last_seen TIMESTAMP DEFAULT NOW(),
+                last_decay TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (namespace, token)
+            );
+        """)
+        
+        # Create index on namespace for fast namespace filtering
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_label_tokens_namespace 
+            ON label_tokens(namespace);
+        """)
+        
+        # Create index on last_seen for time-based queries
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_label_tokens_last_seen 
+            ON label_tokens(last_seen);
+        """)
+        
+        conn.commit()
+        logger.info("✅ Created label_tokens table with indexes (V7 schema)")
+    finally:
+        cur.close()
+        conn.close()
+
+
 def create_embedding_table(embedding_dim: int) -> None:
     """Create an embedding table for a specific dimension (V2 schema with foreign key)."""
     table_name = f"memory_{embedding_dim}"
