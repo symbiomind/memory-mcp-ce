@@ -10,9 +10,10 @@ Based on MCP Python SDK v1.24.0 patterns.
 """
 
 import logging
+import functools
 from typing import Any
 
-from pydantic import AnyHttpUrl
+from pydantic import AnyHttpUrl, ValidationError
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.exceptions import HTTPException
@@ -34,6 +35,7 @@ from app.database import init_database
 from app.embedding import get_embedding_dimension
 from app.encryption import is_encryption_enabled
 from app import tools
+from app.tools import add_timezone_to_response, add_performance_to_response
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -48,6 +50,54 @@ SERVER_URL = config_server_url if config_server_url else f"http://localhost:{SER
 
 # MCP scope for OAuth
 MCP_SCOPE = "mcp"
+
+
+def validation_error_handler(func):
+    """
+    Decorator to catch Pydantic ValidationError and return clean MCP Tool Execution Error.
+    
+    Per MCP spec, input validation errors should be Tool Execution Errors (isError: true)
+    with actionable feedback, NOT Protocol Errors. This allows AI clients to self-correct
+    and retry with adjusted parameters.
+    
+    Converts raw Pydantic tracebacks into clean JSON responses like:
+    {
+        "error": "Invalid parameter",
+        "details": "days: Input should be a valid integer, received 0.5 (float)",
+        "performance": "0.000 0.000 0.000"
+    }
+    """
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except ValidationError as e:
+            # Parse Pydantic error into clean, actionable format
+            errors = e.errors()
+            if errors:
+                err = errors[0]
+                # Get parameter name from location tuple
+                loc = err.get('loc', ())
+                param = loc[0] if loc else 'unknown'
+                # Get the error message
+                msg = err.get('msg', 'validation error')
+                # Get the actual input value and its type
+                input_val = err.get('input')
+                input_type = type(input_val).__name__
+                
+                details = f"{param}: {msg}, received {input_val} ({input_type})"
+            else:
+                details = str(e)
+            
+            # Return clean error response with timezone and performance
+            response = {
+                "error": "Invalid parameter",
+                "details": details
+            }
+            response = add_timezone_to_response(response)
+            return add_performance_to_response(response, 0.0, 0.0, 0.0)
+    
+    return wrapper
 
 
 def create_mcp_server() -> FastMCP:
@@ -252,7 +302,7 @@ def register_api_routes(mcp: FastMCP) -> None:
 
 
 def register_tools(mcp: FastMCP) -> None:
-    """Register all MCP tools."""
+    """Register all MCP tools with validation error handling."""
     
     @mcp.tool(
         annotations={
@@ -263,6 +313,7 @@ def register_tools(mcp: FastMCP) -> None:
             "idempotentHint": False
         }
     )
+    @validation_error_handler
     async def store_memory(
         content: str,
         labels: str | None = None,
@@ -288,6 +339,7 @@ def register_tools(mcp: FastMCP) -> None:
             "openWorldHint": False
         }
     )
+    @validation_error_handler
     async def retrieve_memories(
         query: str | None = None,
         labels: str | None = None,
@@ -327,6 +379,7 @@ def register_tools(mcp: FastMCP) -> None:
             "idempotentHint": True
         }
     )
+    @validation_error_handler
     async def add_labels(
         memory_id: int,
         labels: str,
@@ -352,6 +405,7 @@ def register_tools(mcp: FastMCP) -> None:
             "idempotentHint": True
         }
     )
+    @validation_error_handler
     async def del_labels(
         memory_id: int,
         labels: str,
@@ -377,6 +431,7 @@ def register_tools(mcp: FastMCP) -> None:
             "idempotentHint": True
         }
     )
+    @validation_error_handler
     async def delete_memory(
         memory_id: int,
     ) -> dict[str, Any]:
@@ -398,6 +453,7 @@ def register_tools(mcp: FastMCP) -> None:
             "openWorldHint": False
         }
     )
+    @validation_error_handler
     async def get_memory(
         memory_id: int,
     ) -> dict[str, Any]:
@@ -419,6 +475,7 @@ def register_tools(mcp: FastMCP) -> None:
             "openWorldHint": False
         }
     )
+    @validation_error_handler
     async def random_memory(
         labels: str | None = None,
         source: str | None = None,
@@ -442,6 +499,7 @@ def register_tools(mcp: FastMCP) -> None:
             "openWorldHint": False
         }
     )
+    @validation_error_handler
     async def memory_stats(
         labels: str | None = None,
         source: str | None = None,
@@ -471,6 +529,7 @@ def register_tools(mcp: FastMCP) -> None:
             "openWorldHint": False
         }
     )
+    @validation_error_handler
     async def trending_labels(
         days: int = 30,
         limit: int = 10,
