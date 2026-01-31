@@ -1,6 +1,7 @@
 
 from app.database import get_db_connection, add_embedding_to_state, get_memory_embedding_tables
 from app.embedding import get_embedding, get_embedding_dimension
+from app.utils import tokenize_labels
 import psycopg2.extras
 from app.config import EMBEDDING_MODEL, NAMESPACE, TIMEZONE, TIMEZONE_DISABLED, PERFORMANCE_METRICS
 import time
@@ -560,6 +561,38 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
     cur.close()
     conn.close()
     db_time = time.time() - db_start
+
+    # Track label token popularity (only if labels exist)
+    # This runs AFTER memory is committed - token tracking failure won't affect memory storage
+    if label_list:
+        token_counts = tokenize_labels(label_list)
+        
+        if token_counts:
+            try:
+                conn = get_db_connection()
+                cur = conn.cursor()
+                
+                # Batch upsert using unnest() - single query for all tokens
+                tokens = list(token_counts.keys())
+                counts = list(token_counts.values())
+                namespaces = [namespace] * len(tokens)
+                
+                cur.execute("""
+                    INSERT INTO label_tokens (namespace, token, count, last_seen)
+                    SELECT unnest(%s::varchar[]), unnest(%s::varchar[]), unnest(%s::int[]), NOW()
+                    ON CONFLICT (namespace, token) 
+                    DO UPDATE SET 
+                        count = label_tokens.count + EXCLUDED.count,
+                        last_seen = NOW()
+                """, (namespaces, tokens, counts))
+                conn.commit()
+                logger.debug(f"📊 Tracked {len(tokens)} label tokens for memory")
+            except Exception as e:
+                # Don't fail the whole operation - memory was already stored successfully
+                logger.warning(f"⚠️ Failed to track label tokens: {e}")
+            finally:
+                cur.close()
+                conn.close()
 
     # Display appropriate ID based on namespace mode
     display_id = get_display_id(memory_id, next_content_id)
