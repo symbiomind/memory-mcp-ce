@@ -643,8 +643,7 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
     cur = conn.cursor()
 
     # Check for similar memories (duplicate detection) - query embedding table with JOIN to memories
-    # Also capture top 2 for related_memories feature
-    warnings = []
+    # Capture top 2 for related_memories feature (unified response format)
     related_memories_data = []  # For storing in state.related
     try:
         check_sql = f"""
@@ -666,20 +665,7 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
             if mem_content is None:
                 # Skip encrypted memories we can't decrypt for duplicate detection
                 continue
-            if similarity >= 0.70:  # 70% threshold
-                percentage = int(similarity * 100)
-                # Get the correct display ID for the warning message
-                display_id = get_display_id(mem_id, mem_content_id)
-                # Tiered warning messages based on similarity level
-                if similarity >= 1.0:
-                    warnings.append(f"❌ Exact match with memory #{display_id}")
-                elif similarity >= 0.91:
-                    warnings.append(f"⚠️ Worth reviewing for context to memory #{display_id} ({percentage}% match)")
-                elif similarity >= 0.81:
-                    warnings.append(f"📌 Explores similar territory to memory #{display_id} ({percentage}% match)")
-                else:  # 0.70 - 0.80
-                    warnings.append(f"ℹ️ Semantically related to memory #{display_id} ({percentage}% match)")
-                
+            if similarity >= 0.70:  # 70% threshold for related memories
                 # Capture for related_memories (top 2 with ≥70% similarity)
                 # Store only id and similarity - source is looked up at display time
                 related_memories_data.append({
@@ -739,6 +725,11 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
     )
 
     conn.commit()
+    
+    # V9: Format related memories for display BEFORE closing cursor
+    # This needs the cursor to look up content_ids and sources
+    formatted_related = format_related_for_display(related_memories_data, cur) if related_memories_data else []
+    
     cur.close()
     conn.close()
     db_time = time.time() - db_start
@@ -782,8 +773,9 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
         "message": f"✅ Memory stored with ID {display_id}" + (" 🔐" if is_encrypted else "")
     }
     
-    if warnings:
-        result["warnings"] = warnings
+    # V9: Unified related_memories format (consistent with retrieve_memories/get_memory)
+    # Always include related_memories - empty array when none found
+    result["related_memories"] = formatted_related
     
     # Add performance metrics and timezone
     total_time = time.time() - total_start
