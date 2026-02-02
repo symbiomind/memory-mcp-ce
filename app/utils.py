@@ -72,7 +72,7 @@ def tokenize_labels(labels: list[str]) -> dict[str, int]:
         tokens = re.split(r'[-_\s]+', label.lower())
         
         for token in tokens:
-            if token:  # Skip empty strings
+            if token and not token.isdigit():  # Skip empty strings and pure numeric tokens
                 token_counts[token] = token_counts.get(token, 0) + 1
     
     return token_counts
