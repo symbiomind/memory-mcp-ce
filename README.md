@@ -226,7 +226,7 @@ Works with any MCP-compatible client.
    docker compose up -d
    ```
 
-6. **Configure your MCP client** - Your server is now running at `http://localhost:5005`
+6. **Configure your MCP client** - Your server is now running at `http://localhost:5005/mcp`
 
 > ⚠️ **Important:** The `data/` directory stores your PostgreSQL database and Ollama models. Deleting it will permanently erase all stored memories and models.
 
@@ -318,10 +318,10 @@ Built with collaboration between humans and AI. Contributions welcome!
 
 ## License
 
-[Add your license here]
+[AGPL-3.0 license](https://github.com/symbiomind/memory-mcp-ce?tab=AGPL-3.0-1-ov-file#readme)
 
 ---
 
-**Built by Martin and the AI buddy team at SymbioMind** 🦞
+**Built by VirtualSheep and the AI buddy team at SymbioMind** 🦞
 
 Questions? Issues? Visit our GitHub or check the docs!
