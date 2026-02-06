@@ -472,6 +472,55 @@ def get_memory_embedding_tables(memory_id: int) -> dict[str, list[str]]:
         conn.close()
 
 
+def remove_embedding_from_state(memory_id: int, table_name: str, model_name: str) -> None:
+    """
+    Remove an embedding model from a memory's state.embedding_tables[table_name] array.
+    
+    This is the inverse of add_embedding_to_state(). Used when deleting embeddings
+    for a specific model (e.g., when re-embedding with force=true or explicit delete).
+    
+    If the model array becomes empty after removal, the table key is also removed.
+    If embedding_tables becomes empty, it's left as an empty object {}.
+    
+    Args:
+        memory_id: The memory ID to update
+        table_name: The embedding table name (e.g., "memory_768")
+        model_name: The model name to remove (e.g., "embeddinggemma:300m")
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        # Use PostgreSQL JSONB operations to remove model from table's array
+        # 1. Remove the model from the array
+        # 2. If array is now empty, remove the table key entirely
+        cur.execute("""
+            UPDATE memories
+            SET state = CASE
+                -- If after removal the array would be empty, remove the table key
+                WHEN jsonb_array_length(
+                    COALESCE(state->'embedding_tables'->%s, '[]'::jsonb) - %s
+                ) = 0
+                THEN jsonb_set(
+                    COALESCE(state, '{}'::jsonb),
+                    '{embedding_tables}',
+                    COALESCE(state->'embedding_tables', '{}'::jsonb) - %s
+                )
+                -- Otherwise just remove the model from the array
+                ELSE jsonb_set(
+                    COALESCE(state, '{}'::jsonb),
+                    ARRAY['embedding_tables', %s],
+                    COALESCE(state->'embedding_tables'->%s, '[]'::jsonb) - %s
+                )
+            END
+            WHERE id = %s
+            AND state->'embedding_tables'->%s IS NOT NULL;
+        """, (table_name, model_name, table_name, table_name, table_name, model_name, memory_id, table_name))
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+
+
 # =============================================================================
 # OAuth Session Persistence Functions
 # =============================================================================

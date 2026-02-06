@@ -1,8 +1,12 @@
 """
-Memory MCP-CE API - Embeddings Endpoint
+Memory MCP-CE API - Embeddings Endpoints
 
 POST /api/embeddings/generate
 Re-embeds memories with a new embedding model in the background.
+Supports force=true to delete existing embeddings first.
+
+DELETE /api/embeddings/delete
+Deletes all embeddings for a specific model from a namespace (async).
 """
 
 import logging
@@ -16,9 +20,11 @@ import psycopg2.extras
 from app.config import NAMESPACE
 from app.database import (
     get_db_connection,
+    get_existing_embedding_tables,
     table_exists,
     create_embedding_table,
     add_embedding_to_state,
+    remove_embedding_from_state,
 )
 from app.encryption import decode_or_decrypt_content
 
@@ -233,6 +239,136 @@ def _do_reembedding(
         conn.close()
 
 
+def _do_delete_embeddings(
+    embedding_model: str,
+    namespace: Optional[str],
+) -> None:
+    """
+    Background worker function that deletes embeddings for a specific model.
+    
+    This runs in a separate thread and:
+    1. Finds all embedding tables that contain this model
+    2. Deletes rows from each table where embedding_model matches
+    3. Updates state.embedding_tables in affected memories
+    
+    Args:
+        embedding_model: Model name to delete embeddings for
+        namespace: If set, filter to this namespace. If None/empty, delete from ALL namespaces.
+    """
+    namespace_display = namespace if namespace else "(all namespaces)"
+    logger.info(f"🗑️ Starting embedding deletion job: model={embedding_model}, namespace={namespace_display}")
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Find all embedding tables (memory_768, memory_384, etc.)
+        embedding_tables = get_existing_embedding_tables()
+        
+        if not embedding_tables:
+            logger.info(f"✅ No embedding tables found - nothing to delete")
+            return
+        
+        total_deleted = 0
+        memories_affected = set()
+        
+        for table_name in embedding_tables:
+            # Build delete query with optional namespace filter
+            where_clauses = ["embedding_model = %s"]
+            params = [embedding_model]
+            
+            if namespace:
+                where_clauses.append("namespace = %s")
+                params.append(namespace)
+            
+            # First, get the memory IDs that will be affected (for state update)
+            cur.execute(f"""
+                SELECT DISTINCT memory_id 
+                FROM {table_name} 
+                WHERE {' AND '.join(where_clauses)};
+            """, params)
+            
+            affected_ids = [row[0] for row in cur.fetchall()]
+            
+            if affected_ids:
+                # Delete the embeddings
+                cur.execute(f"""
+                    DELETE FROM {table_name} 
+                    WHERE {' AND '.join(where_clauses)};
+                """, params)
+                
+                deleted_count = cur.rowcount
+                total_deleted += deleted_count
+                
+                logger.info(f"🗑️ Deleted {deleted_count} embeddings from {table_name}")
+                
+                # Update state.embedding_tables for each affected memory
+                for memory_id in affected_ids:
+                    remove_embedding_from_state(memory_id, table_name, embedding_model)
+                    memories_affected.add(memory_id)
+        
+        conn.commit()
+        logger.info(f"✅ Embedding deletion complete: {total_deleted} embeddings deleted, {len(memories_affected)} memories affected")
+        
+    except Exception as e:
+        logger.error(f"❌ Embedding deletion job failed: {str(e)}")
+        conn.rollback()
+    finally:
+        cur.close()
+        conn.close()
+
+
+async def delete_embeddings_handler(request_body: dict) -> dict:
+    """
+    Handle DELETE /api/embeddings/delete request.
+    
+    Deletes all embeddings for a specific model from a namespace (or all namespaces).
+    Runs asynchronously in background thread.
+    
+    Request body:
+    {
+        "embedding_model": "model-name",    # Required: Model name to delete
+        "namespace": "personal"             # Optional: defaults to .env NAMESPACE (empty = ALL)
+    }
+    
+    Returns:
+        202 response dict with status and message
+    
+    Raises:
+        ValueError if required fields are missing
+    """
+    # Validate required fields
+    embedding_model = request_body.get("embedding_model")
+    
+    if not embedding_model:
+        raise ValueError("Missing required field: embedding_model")
+    
+    # Namespace handling:
+    # - If provided in request → use that value
+    # - If not provided → use .env NAMESPACE (could be empty string meaning "all namespaces")
+    # - Empty string / None = delete from ALL namespaces
+    namespace = request_body.get("namespace")
+    if namespace is None:
+        namespace = NAMESPACE  # From .env - could be "" (all) or a specific value
+    
+    # Start background thread for deletion
+    thread = threading.Thread(
+        target=_do_delete_embeddings,
+        args=(embedding_model, namespace),
+        daemon=True,
+    )
+    thread.start()
+    
+    # Display-friendly namespace for response
+    namespace_display = namespace if namespace else "(all namespaces)"
+    
+    return {
+        "status": "processing",
+        "message": f"Embedding deletion started in background for model '{embedding_model}'",
+        "namespace": namespace_display,
+    }
+
+
 async def generate_embeddings_handler(request_body: dict) -> dict:
     """
     Handle POST /api/embeddings/generate request.
@@ -243,13 +379,18 @@ async def generate_embeddings_handler(request_body: dict) -> dict:
         "embedding_model": "model-name",    # Required: Model name
         "embedding_api_key": "sk-...",      # Optional: API key for the service
         "embedding_dims": 768,              # Optional: Request specific dimensions (for MRL models)
-        "namespace": "personal"             # Optional: defaults to .env NAMESPACE
+        "namespace": "personal",            # Optional: defaults to .env NAMESPACE
+        "force": false                      # Optional: if true, delete existing embeddings first
     }
     
     If embedding_dims is specified:
       - passes dimensions parameter to embedding API
       - CRITICAL: validates returned dimensions match, fails if mismatch
       - prevents wrong-sized vectors in memory_{dims} tables
+    
+    If force is true:
+      - Deletes existing embeddings for this model before re-embedding
+      - Useful when embedding model has been updated (e.g., ollama pull)
     
     Returns:
         202 response dict with status and message
@@ -289,6 +430,11 @@ async def generate_embeddings_handler(request_body: dict) -> dict:
     if namespace is None:
         namespace = NAMESPACE  # From .env - could be "" (all) or a specific value
     
+    # Parse force parameter (default: false)
+    force = request_body.get("force", False)
+    if isinstance(force, str):
+        force = force.lower() in ("true", "1", "yes")
+    
     # Create client to detect dimensions
     client = OpenAI(
         base_url=embedding_url,
@@ -304,6 +450,12 @@ async def generate_embeddings_handler(request_body: dict) -> dict:
     if not table_exists(table_name):
         logger.info(f"📦 Creating new embedding table: {table_name}")
         create_embedding_table(dims)
+    
+    # If force=true, delete existing embeddings first (synchronously before starting re-embed)
+    if force:
+        logger.info(f"🔄 Force mode: deleting existing embeddings for model '{embedding_model}' before re-embedding")
+        # Run deletion synchronously so re-embedding sees clean state
+        _do_delete_embeddings(embedding_model, namespace)
     
     # Start background thread (pass embedding_dims for consistent generation)
     thread = threading.Thread(
@@ -327,5 +479,10 @@ async def generate_embeddings_handler(request_body: dict) -> dict:
     # Include embedding_dims in response if it was specified
     if embedding_dims is not None:
         response["embedding_dims"] = embedding_dims
+    
+    # Include force in response if it was true
+    if force:
+        response["force"] = True
+        response["message"] = f"Force re-embedding started (deleted existing, now re-embedding) for model '{embedding_model}' ({dims}D)"
     
     return response

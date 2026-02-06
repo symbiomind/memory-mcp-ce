@@ -252,7 +252,31 @@ def register_api_routes(mcp: FastMCP) -> None:
     If API_BEARER_TOKEN is not set, routes return 404 as if they don't exist.
     """
     from starlette.responses import JSONResponse
-    from app.api.embeddings import generate_embeddings_handler
+    from app.api.embeddings import generate_embeddings_handler, delete_embeddings_handler
+    
+    def _validate_api_auth(request: Request) -> None:
+        """
+        Validate API Bearer token authentication.
+        
+        Raises:
+            HTTPException(404) if API_BEARER_TOKEN not set (API disabled)
+            HTTPException(401) if Authorization header missing or invalid
+        """
+        # If API_BEARER_TOKEN not set, return 404 (API disabled)
+        if not API_BEARER_TOKEN:
+            raise HTTPException(404, "Not Found")
+        
+        # Validate Authorization header
+        auth_header = request.headers.get("Authorization")
+        if not auth_header:
+            raise HTTPException(401, "Missing Authorization header")
+        
+        if not auth_header.startswith("Bearer "):
+            raise HTTPException(401, "Invalid Authorization header format")
+        
+        token = auth_header[7:]  # Remove "Bearer " prefix
+        if token != API_BEARER_TOKEN:
+            raise HTTPException(401, "Invalid API token")
     
     @mcp.custom_route("/api/embeddings/generate", methods=["POST"])
     async def api_generate_embeddings(request: Request) -> Response:
@@ -294,9 +318,35 @@ def register_api_routes(mcp: FastMCP) -> None:
             logger.error(f"❌ API error: {str(e)}", exc_info=True)
             raise HTTPException(500, f"Internal server error: {str(e)}")
     
+    @mcp.custom_route("/api/embeddings/delete", methods=["DELETE"])
+    async def api_delete_embeddings(request: Request) -> Response:
+        """
+        DELETE /api/embeddings/delete
+        
+        Delete all embeddings for a specific model from a namespace.
+        Returns 202 Accepted immediately while processing continues in background.
+        """
+        _validate_api_auth(request)
+        
+        # Parse request body
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, "Invalid JSON body")
+        
+        # Process request
+        try:
+            result = await delete_embeddings_handler(body)
+            return JSONResponse(content=result, status_code=202)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        except Exception as e:
+            logger.error(f"❌ API error: {str(e)}", exc_info=True)
+            raise HTTPException(500, f"Internal server error: {str(e)}")
+    
     # Log API status
     if API_BEARER_TOKEN:
-        logger.info(f"🔌 REST API enabled: POST /api/embeddings/generate")
+        logger.info(f"🔌 REST API enabled: POST /api/embeddings/generate, DELETE /api/embeddings/delete")
     else:
         logger.info(f"🔒 REST API disabled (API_BEARER_TOKEN not set)")
 
