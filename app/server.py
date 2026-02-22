@@ -474,7 +474,7 @@ def register_tools(mcp: FastMCP) -> None:
     
     @mcp.tool(
         annotations={
-            "title": "Replace a label on a memory",
+            "title": "Replace labels on a memory",
             "readOnlyHint": False,
             "openWorldHint": False,
             "destructiveHint": False,
@@ -482,26 +482,26 @@ def register_tools(mcp: FastMCP) -> None:
         }
     )
     @validation_error_handler
-    async def replace_label(
+    async def replace_labels(
         memory_id: int,
         target: str,
         new: str,
     ) -> dict[str, Any]:
         """
-        Replace a specific label with a new label atomically (case-insensitive target match).
+        Replace one or more labels with one or more new labels atomically.
         
         Enables atomic label state transitions without race conditions from separate
-        add/delete operations. Useful for workflow states, read/unread markers, etc.
+        add/delete operations. Supports both single and multi-label operations.
         
         Args:
             memory_id: The unique ID of the memory
-            target: The label to find and replace (case-insensitive match)
-            new: The new label to replace it with (preserves exact case provided)
+            target: Label(s) to find and remove (comma-separated, case-insensitive)
+            new: Label(s) to add in their place (comma-separated, preserves case)
             
         Returns:
             Result with success status and updated labels
         """
-        return tools.replace_label(memory_id, target, new)
+        return tools.replace_labels(memory_id, target, new)
     
     @mcp.tool(
         annotations={
@@ -634,7 +634,7 @@ def register_tools(mcp: FastMCP) -> None:
         """
         return tools.trending_labels(days, limit)
     
-    logger.info(f"🛠️ Registered 10 tools: store_memory, retrieve_memories, add_labels, del_labels, replace_label, delete_memory, get_memory, random_memory, memory_stats, trending_labels")
+    logger.info(f"🛠️ Registered 10 tools: store_memory, retrieve_memories, add_labels, del_labels, replace_labels, delete_memory, get_memory, random_memory, memory_stats, trending_labels")
 
 
 def main():

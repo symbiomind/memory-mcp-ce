@@ -2087,19 +2087,24 @@ def del_labels(memory_id: int, labels: str) -> dict:
         conn.close()
 
 
-def replace_label(memory_id: int, target: str, new: str) -> dict:
+def replace_labels(memory_id: int, target: str, new: str) -> dict:
     """
-    Replace a specific label with a new label atomically (case-insensitive target match).
+    Replace one or more labels with one or more new labels atomically.
     
     This enables atomic label state transitions without race conditions from
-    separate add/delete operations. Primary use case: messaging read states
-    (e.g., '@claude' → '+claude'), but designed as a general-purpose primitive.
+    separate add/delete operations. Supports both single and multi-label operations.
+    
+    Use cases:
+    - Workflow states: target="unprocessed" new="processed,reviewed"
+    - Read markers: target="@claude" new="+claude"
+    - Bulk transitions: target="draft,pending" new="published"
     
     Behavior:
     - Find memory by ID (respects namespace)
-    - Locate target label (case-insensitive match)
-    - Replace ALL matching instances with new label
-    - De-duplicate if new label already exists
+    - Remove ALL target labels (case-insensitive match)
+    - Add ALL new labels in their place
+    - De-duplicate against existing labels
+    - Fail-fast if ANY target label is not found
     
     V6 Namespace ID Handling:
     - Wildcard namespace: memory_id is the real database ID
@@ -2107,15 +2112,15 @@ def replace_label(memory_id: int, target: str, new: str) -> dict:
     
     Args:
         memory_id: The unique ID of the memory
-        target: The label to find and replace (case-insensitive)
-        new: The label to replace it with (preserves exact case provided)
+        target: Label(s) to find and remove (comma-separated, case-insensitive)
+        new: Label(s) to add in their place (comma-separated, preserves case)
         
     Returns:
         Result with success status and updated labels
     """
     # Performance timing
     total_start = time.time()
-    embedding_time = 0.0  # No embedding for replace_label
+    embedding_time = 0.0  # No embedding for replace_labels
     db_time = 0.0
     
     # Auto-populate from config
@@ -2124,24 +2129,36 @@ def replace_label(memory_id: int, target: str, new: str) -> dict:
     # Store the user-facing ID for messages
     user_facing_id = memory_id
     
-    # Validate inputs - reject empty strings
-    target = target.strip() if target else ""
-    new = new.strip() if new else ""
+    # Parse target and new as comma-separated lists
+    target_labels = normalize_labels(target)
+    new_labels = normalize_labels(new)
     
-    if not target or not new:
+    if not target_labels:
         total_time = time.time() - total_start
         response = add_timezone_to_response({
             "success": False,
-            "error": "❌ Target and new labels cannot be empty"
+            "error": "❌ Target labels cannot be empty"
         })
         return add_performance_to_response(response, embedding_time, db_time, total_time)
     
-    # Check if target and new are identical (case-insensitive)
-    if target.lower() == new.lower():
+    if not new_labels:
         total_time = time.time() - total_start
         response = add_timezone_to_response({
             "success": False,
-            "error": f"❌ Target and new labels are identical ('{target}') - no changes made"
+            "error": "❌ New labels cannot be empty"
+        })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
+    
+    # Check for overlap between target and new (case-insensitive)
+    target_lower_set = {t.lower() for t in target_labels}
+    new_lower_set = {n.lower() for n in new_labels}
+    overlap = target_lower_set & new_lower_set
+    
+    if overlap:
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({
+            "success": False,
+            "error": f"❌ Labels appear in both target and new: {', '.join(sorted(overlap))}"
         })
         return add_performance_to_response(response, embedding_time, db_time, total_time)
     
@@ -2188,37 +2205,34 @@ def replace_label(memory_id: int, target: str, new: str) -> dict:
         if result[1]:
             existing_labels = result[1] if isinstance(result[1], list) else json.loads(result[1])
         
-        # Check if target label exists (case-insensitive)
-        target_lower = target.lower()
-        target_found = any(label.lower() == target_lower for label in existing_labels)
+        # Check that ALL target labels exist (fail-fast)
+        existing_lower = {label.lower() for label in existing_labels}
+        missing_targets = [t for t in target_labels if t.lower() not in existing_lower]
         
-        if not target_found:
+        if missing_targets:
             db_time = time.time() - db_start
             total_time = time.time() - total_start
+            if len(missing_targets) == 1:
+                error_msg = f"❌ Label '{missing_targets[0]}' not found on memory #{user_facing_id}"
+            else:
+                error_msg = f"❌ Labels not found on memory #{user_facing_id}: {', '.join(missing_targets)}"
             response = add_timezone_to_response({
                 "success": False,
-                "error": f"❌ Label '{target}' not found on memory #{user_facing_id}"
+                "error": error_msg
             })
             return add_performance_to_response(response, embedding_time, db_time, total_time)
         
-        # Replace all instances of target with new (case-insensitive match)
-        # Then de-duplicate while preserving order
-        updated_labels = []
-        new_already_added = False
+        # Build updated labels:
+        # 1. Remove all target labels (case-insensitive)
+        # 2. Add new labels (de-duplicated against remaining)
+        updated_labels = [label for label in existing_labels if label.lower() not in target_lower_set]
         
-        for label in existing_labels:
-            if label.lower() == target_lower:
-                # Replace with new label (only add once to handle duplicates)
-                if not new_already_added:
-                    updated_labels.append(new)
-                    new_already_added = True
-            elif label.lower() == new.lower():
-                # New label already exists - skip to avoid duplicate
-                if not new_already_added:
-                    updated_labels.append(label)  # Keep existing case
-                    new_already_added = True
-            else:
-                updated_labels.append(label)
+        # Add new labels, avoiding duplicates (case-insensitive check)
+        updated_lower = {label.lower() for label in updated_labels}
+        for new_label in new_labels:
+            if new_label.lower() not in updated_lower:
+                updated_labels.append(new_label)
+                updated_lower.add(new_label.lower())
         
         # Update memories table (source of truth)
         update_sql = """
@@ -2232,9 +2246,17 @@ def replace_label(memory_id: int, target: str, new: str) -> dict:
         db_time = time.time() - db_start
         total_time = time.time() - total_start
         
+        # Build descriptive message
+        if len(target_labels) == 1 and len(new_labels) == 1:
+            msg = f"✅ Label replaced on memory #{user_facing_id}: '{target_labels[0]}' → '{new_labels[0]}'"
+        else:
+            target_str = ', '.join(target_labels)
+            new_str = ', '.join(new_labels)
+            msg = f"✅ Labels replaced on memory #{user_facing_id}: [{target_str}] → [{new_str}]"
+        
         response = add_timezone_to_response({
             "success": True,
-            "message": f"✅ Label replaced on memory #{user_facing_id}: '{target}' → '{new}'",
+            "message": msg,
             "labels": updated_labels
         })
         return add_performance_to_response(response, embedding_time, db_time, total_time)
@@ -2245,7 +2267,7 @@ def replace_label(memory_id: int, target: str, new: str) -> dict:
         total_time = time.time() - total_start
         response = add_timezone_to_response({
             "success": False,
-            "error": f"❌ Error replacing label: {str(e)}"
+            "error": f"❌ Error replacing labels: {str(e)}"
         })
         return add_performance_to_response(response, embedding_time, db_time, total_time)
     finally:
