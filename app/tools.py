@@ -543,8 +543,9 @@ def parse_source_with_exclusions(source: str | None) -> tuple[List[str], List[st
 _CLASSIFIER_OPS = ('>=', '<=', '!=', '>', '<', '=')
 
 # Characters that would make the filter grammar unparseable if they appeared
-# inside a classifier key.
-_CLASSIFIER_RESERVED = (',', '!', '<', '>', '=')
+# inside a classifier key. '*' is reserved because a bare '*' is the wildcard
+# state filter - a literal key named '*' would make the grammar ambiguous.
+_CLASSIFIER_RESERVED = (',', '!', '<', '>', '=', '*')
 
 
 def _coerce_classifier_value(raw: str) -> Any:
@@ -654,6 +655,8 @@ def parse_classifiers_filter(classifiers: str | None) -> tuple[List[dict], str |
         is_task>=0.7        present, numeric and passes - strict
         !is_greeting>=0.5   exclude matching rows - fails open
         team=payments       present, string, exact match
+        *                   classified at all (has at least one key)
+        !*                  not classified at all (NULL or empty map)
 
     Filters are AND-combined. Unlike labels and source - whose includes are
     OR-combined - classifier includes AND, because "is_task>=0.7,
@@ -678,6 +681,21 @@ def parse_classifiers_filter(classifiers: str | None) -> tuple[List[dict], str |
             part = part[1:].strip()
             if not part:
                 continue
+
+        # Wildcard state filter: '*' = has at least one classifier key,
+        # '!*' = has none (never classified, or ran and produced nothing).
+        # This is the only filter that can see the NULL vs '{}' vs {...}
+        # distinction; '!key' is per-key absence and cannot.
+        if part == '*':
+            filters.append({'key': None, 'op': None, 'value': None,
+                            'negate': negate, 'wildcard': True})
+            continue
+        if part.startswith('*'):
+            return [], (
+                "❌ Classifier filter '*' takes no operator or value. A threshold over "
+                "an arbitrary set of keys has no honest meaning - it would compare "
+                "unrelated scales against each other. Use '*' or '!*' alone, or name a key."
+            )
 
         key, op, value = part, None, None
         for candidate in _CLASSIFIER_OPS:
@@ -707,7 +725,8 @@ def parse_classifiers_filter(classifiers: str | None) -> tuple[List[dict], str |
         if op in ('>', '>=', '<', '<=') and isinstance(value, bool):
             return [], f"❌ Classifier filter '{key}{op}' needs a number, not a boolean."
 
-        filters.append({'key': key, 'op': op, 'value': value, 'negate': negate})
+        filters.append({'key': key, 'op': op, 'value': value,
+                        'negate': negate, 'wildcard': False})
 
     return filters, None
 
@@ -736,7 +755,14 @@ def build_classifiers_sql(filters: List[dict], column: str = "classifiers") -> t
     for f in filters:
         key, op, value, negate = f['key'], f['op'], f['value'], f['negate']
 
-        if op is None:
+        if f.get('wildcard'):
+            # "has at least one key". NULL makes this NULL, so the row drops out
+            # of '*' and - via the COALESCE below - is matched by '!*'.
+            core = (
+                f"jsonb_typeof({column}) = 'object' AND {column} <> '{{}}'::jsonb"
+            )
+            core_params = []
+        elif op is None:
             core = f"{column} ? %s"
             core_params = [key]
         elif isinstance(value, bool):
@@ -2687,7 +2713,10 @@ def set_classifiers(memory_id: int, classifiers: str, merge: bool = True) -> dic
             })
             return add_performance_to_response(response, embedding_time, db_time, total_time)
 
-        existing = row[0] if row[0] else {}
+        # Defensive: '!*' surfaces rows holding a non-object value (only
+        # reachable by writing the column outside these tools), so do not
+        # assume a dict here.
+        existing = row[0] if isinstance(row[0], dict) else {}
 
         if merge:
             merged = dict(existing)
@@ -2789,7 +2818,10 @@ def del_classifiers(memory_id: int, keys: str) -> dict:
             })
             return add_performance_to_response(response, embedding_time, db_time, total_time)
 
-        existing = row[0] if row[0] else {}
+        # Defensive: '!*' surfaces rows holding a non-object value (only
+        # reachable by writing the column outside these tools), so do not
+        # assume a dict here.
+        existing = row[0] if isinstance(row[0], dict) else {}
         remaining = {k: v for k, v in existing.items() if k not in target_keys}
         removed = [k for k in target_keys if k in existing]
 

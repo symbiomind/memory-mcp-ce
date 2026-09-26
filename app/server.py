@@ -419,7 +419,7 @@ def register_tools(mcp: FastMCP) -> None:
             query: Optional query text for semantic search (uses embeddings)
             labels: Optional comma-separated labels for filtering (fuzzy match). Use ! prefix to exclude (e.g., 'beer,!wine')
             source: Optional source filter (fuzzy match). Use ! prefix to exclude (e.g., '!clawdbot')
-            classifiers: Optional exact-match classifier filter, comma-separated and AND-combined. 'is_task' = key present, '!is_task' = key absent, 'is_task>=0.7' = numeric threshold (strict), '!is_greeting>=0.5' = exclude matches (unclassified memories still pass), 'team=payments' = string match
+            classifiers: Optional exact-match classifier filter, comma-separated and AND-combined. 'is_task' = key present, '!is_task' = key absent, 'is_task>=0.7' = numeric threshold (strict), '!is_greeting>=0.5' = exclude matches (unclassified memories still pass), 'team=payments' = string match, '*' = classified at all, '!*' = not classified at all (the pending queue)
             num_results: Number of results to return (default: 5)
             
         Returns:
@@ -669,7 +669,7 @@ def register_tools(mcp: FastMCP) -> None:
         Args:
             labels: Optional filter for labels (fuzzy match, comma-separated). Use ! prefix to exclude (e.g., 'beer,!wine')
             source: Optional source filter (fuzzy match). Use ! prefix to exclude (e.g., '!clawdbot')
-            classifiers: Optional exact-match classifier filter, comma-separated and AND-combined. 'is_task' = key present, '!is_task' = key absent, 'is_task>=0.7' = numeric threshold (strict), '!is_greeting>=0.5' = exclude matches (unclassified memories still pass), 'team=payments' = string match
+            classifiers: Optional exact-match classifier filter, comma-separated and AND-combined. 'is_task' = key present, '!is_task' = key absent, 'is_task>=0.7' = numeric threshold (strict), '!is_greeting>=0.5' = exclude matches (unclassified memories still pass), 'team=payments' = string match, '*' = classified at all, '!*' = not classified at all (the pending queue)
             
         Returns:
             Statistics including total count, matching count, percentage,
