@@ -197,7 +197,7 @@ def create_system_state_table() -> None:
 
 
 def create_memories_table() -> None:
-    """Create the main memories table (source of truth) with V6 schema."""
+    """Create the main memories table (source of truth) with V8 schema."""
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -211,7 +211,8 @@ def create_memories_table() -> None:
                 source VARCHAR(255),
                 timestamp TIMESTAMP DEFAULT NOW(),
                 enc BOOLEAN DEFAULT FALSE,
-                state JSONB DEFAULT '{}'::JSONB
+                state JSONB DEFAULT '{}'::JSONB,
+                classifiers JSONB
             );
         """)
         
@@ -242,8 +243,14 @@ def create_memories_table() -> None:
             ON memories(namespace, content_id DESC);
         """)
         
+        # V8: GIN index for classifier key existence and containment queries
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memories_classifiers 
+            ON memories USING GIN(classifiers);
+        """)
+        
         conn.commit()
-        logger.info("✅ Created memories table with indexes (V6 schema)")
+        logger.info("✅ Created memories table with indexes (V8 schema)")
     finally:
         cur.close()
         conn.close()

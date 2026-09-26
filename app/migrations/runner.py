@@ -13,7 +13,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Current database schema version
-CURRENT_DB_VERSION = 7
+CURRENT_DB_VERSION = 8
 
 # Advisory lock ID for migrations (unique arbitrary number)
 MIGRATION_LOCK_ID = 123456789
@@ -53,6 +53,7 @@ def run_migrations(embedding_dim: int) -> None:
     from app.migrations.v4_to_v5 import migrate_v4_to_v5
     from app.migrations.v5_to_v6 import migrate_v5_to_v6
     from app.migrations.v6_to_v7 import migrate_v6_to_v7
+    from app.migrations.v7_to_v8 import migrate_v7_to_v8
     
     # Get connection for advisory lock
     conn = get_db_connection()
@@ -89,6 +90,7 @@ def run_migrations(embedding_dim: int) -> None:
                     migrate_v4_to_v5()
                     migrate_v5_to_v6()
                     migrate_v6_to_v7()
+                    migrate_v7_to_v8()
                 else:
                     # Tables exist but already V2+ schema (partial migration?)
                     # Run v4→v5 to create fresh V5 system_state, then continue
@@ -96,9 +98,10 @@ def run_migrations(embedding_dim: int) -> None:
                     migrate_v4_to_v5()
                     migrate_v5_to_v6()
                     migrate_v6_to_v7()
+                    migrate_v7_to_v8()
             else:
                 # Fresh installation - create V7 schema from scratch
-                logger.info("🆕 Fresh installation detected - creating V7 schema")
+                logger.info("🆕 Fresh installation detected - creating V8 schema")
                 create_system_state_table()
                 create_memories_table()
                 create_label_tokens_table()
@@ -140,6 +143,11 @@ def run_migrations(embedding_dim: int) -> None:
                     # V6 → V7 migration (label_tokens table for trending labels)
                     migrate_v6_to_v7()
                     current_version = 7
+                
+                if current_version == 7:
+                    # V7 → V8 migration (classifiers column)
+                    migrate_v7_to_v8()
+                    current_version = 8
             else:
                 logger.info(f"✅ Database schema is up to date (version {current_version})")
         
