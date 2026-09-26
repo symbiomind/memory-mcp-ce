@@ -13,7 +13,7 @@ from app.encryption import (
 )
 import json
 import logging
-from typing import List, Any
+from typing import List, Dict, Any
 from datetime import datetime, timezone
 
 # Get logger
@@ -538,6 +538,232 @@ def parse_source_with_exclusions(source: str | None) -> tuple[List[str], List[st
     
     return include_sources, exclude_sources
 
+# Operators supported in classifier filters. Two-character forms must be tried
+# first so that ">=" is not read as ">" followed by a stray "=".
+_CLASSIFIER_OPS = ('>=', '<=', '!=', '>', '<', '=')
+
+# Characters that would make the filter grammar unparseable if they appeared
+# inside a classifier key.
+_CLASSIFIER_RESERVED = (',', '!', '<', '>', '=')
+
+
+def _coerce_classifier_value(raw: str) -> Any:
+    """Coerce a string from a compact filter/value into a JSON scalar."""
+    text = raw.strip()
+    lowered = text.lower()
+    if lowered in ('true', 'false'):
+        return lowered == 'true'
+    if lowered in ('null', 'none', ''):
+        return None
+    try:
+        # int() first so whole numbers stay whole in responses
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        return text
+
+
+def normalize_classifiers(classifiers_value: Any) -> tuple[Dict[str, Any], str | None]:
+    """
+    Normalize classifiers into a flat dict of JSON scalars.
+
+    Accepts: dict, JSON object string, compact "key=value,key=value" string,
+    or None. Mirrors normalize_labels() in being forgiving about input shape.
+
+    Values must be JSON scalars - number, boolean, string or None. Nested
+    objects and arrays are rejected rather than flattened. PostgreSQL would
+    store them happily, and every later filter on the nested path would then
+    return zero rows instead of an error - indistinguishable from "nothing
+    scored that way", so the caller would debug a filter that was never wrong.
+
+    JSON null is a legitimate value: it marks "classifier ran, abstained".
+    The key is present, so an exclusion filter drops the row, while the
+    jsonb_typeof() guard means no numeric comparison can ever match it.
+
+    Returns:
+        Tuple of (classifiers dict, error message or None)
+    """
+    if classifiers_value is None:
+        return {}, None
+
+    raw: Any = classifiers_value
+
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return {}, None
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            # Compact form: "is_greeting=0.96,is_task=0.03"
+            parsed = {}
+            for pair in text.split(','):
+                pair = pair.strip()
+                if not pair:
+                    continue
+                if '=' not in pair:
+                    return {}, f"❌ Classifier '{pair}' is not key=value. Use JSON or \"key=value,key=value\"."
+                key, _, value = pair.partition('=')
+                parsed[key.strip()] = _coerce_classifier_value(value)
+        raw = parsed
+
+    if not isinstance(raw, dict):
+        return {}, "❌ Classifiers must be a JSON object of key/value pairs."
+
+    cleaned: Dict[str, Any] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str):
+            return {}, f"❌ Classifier key {key!r} must be a string."
+        key = key.strip()
+        if not key:
+            return {}, "❌ Classifier keys cannot be empty."
+        if len(key) > 255:
+            return {}, f"❌ Classifier key '{key[:32]}...' exceeds 255 characters."
+        for char in _CLASSIFIER_RESERVED:
+            if char in key:
+                return {}, (
+                    f"❌ Classifier key '{key}' cannot contain '{char}'. "
+                    f"Reserved for filter syntax: {' '.join(_CLASSIFIER_RESERVED)}"
+                )
+        if isinstance(value, bool) or value is None or isinstance(value, str):
+            cleaned[key] = value
+        elif isinstance(value, (int, float)):
+            if isinstance(value, float) and (value != value or value in (float('inf'), float('-inf'))):
+                return {}, f"❌ Classifier '{key}' must be a finite number (got {value})."
+            cleaned[key] = value
+        else:
+            return {}, (
+                f"❌ Classifier '{key}' must be a number, boolean, string or null - "
+                f"got {type(value).__name__}. Flatten nested values caller-side "
+                f"(e.g. \"team.confidence\": 0.67); this server stores one level only."
+            )
+
+    return cleaned, None
+
+
+def parse_classifiers_filter(classifiers: str | None) -> tuple[List[dict], str | None]:
+    """
+    Parse a comma-separated classifier filter string.
+
+    Grammar (reuses the '!' exclusion convention of labels and source):
+        is_task             key present
+        !is_task            key absent, or memory never classified
+        is_task>=0.7        present, numeric and passes - strict
+        !is_greeting>=0.5   exclude matching rows - fails open
+        team=payments       present, string, exact match
+
+    Filters are AND-combined. Unlike labels and source - whose includes are
+    OR-combined - classifier includes AND, because "is_task>=0.7,
+    is_question>=0.7" meaning "either one" would be useless for thresholds.
+
+    Returns:
+        Tuple of (list of filter dicts, error message or None)
+        Each filter: {'key': str, 'op': str | None, 'value': Any, 'negate': bool}
+    """
+    if classifiers is None or not isinstance(classifiers, str):
+        return [], None
+
+    filters: List[dict] = []
+
+    for part in classifiers.split(','):
+        part = part.strip()
+        if not part:
+            continue
+
+        negate = part.startswith('!')
+        if negate:
+            part = part[1:].strip()
+            if not part:
+                continue
+
+        key, op, value = part, None, None
+        for candidate in _CLASSIFIER_OPS:
+            idx = part.find(candidate)
+            if idx > 0:
+                key = part[:idx].strip()
+                op = candidate
+                value = _coerce_classifier_value(part[idx + len(candidate):])
+                break
+
+        if not key:
+            return [], f"❌ Classifier filter '{part}' has no key."
+
+        for char in _CLASSIFIER_RESERVED:
+            if char in key:
+                return [], (
+                    f"❌ Classifier filter key '{key}' contains '{char}'. "
+                    f"Expected key, !key, or key<op>value."
+                )
+
+        if op is not None and value is None:
+            return [], (
+                f"❌ Classifier filter '{key}{op}' has no value. "
+                f"Use '{key}' alone to test that the key is present."
+            )
+
+        if op in ('>', '>=', '<', '<=') and isinstance(value, bool):
+            return [], f"❌ Classifier filter '{key}{op}' needs a number, not a boolean."
+
+        filters.append({'key': key, 'op': op, 'value': value, 'negate': negate})
+
+    return filters, None
+
+
+def build_classifiers_sql(filters: List[dict], column: str = "classifiers") -> tuple[List[str], list]:
+    """
+    Build WHERE clauses and params for parsed classifier filters.
+
+    Comparisons happen in jsonb space (col -> key < to_jsonb(value)) rather
+    than casting to numeric. A cast would raise on any row holding a
+    non-numeric value at that key, killing the whole query rather than
+    skipping the row - and guarding the cast with AND is not reliable, since
+    PostgreSQL does not promise to evaluate AND operands left to right.
+    jsonb comparison cannot raise, and jsonb orders numbers numerically
+    ('2' < '10'), so jsonb_typeof() is needed only for semantics: strings
+    sort below numbers and would otherwise satisfy a "< 0.5" filter.
+
+    Negated filters are wrapped in COALESCE(..., false) so that a NULL
+    classifiers column - never classified - passes the filter instead of
+    being silently dropped. That is what makes exclusions fail open while
+    a background classifier is still catching up.
+    """
+    clauses: List[str] = []
+    params: list = []
+
+    for f in filters:
+        key, op, value, negate = f['key'], f['op'], f['value'], f['negate']
+
+        if op is None:
+            core = f"{column} ? %s"
+            core_params = [key]
+        elif isinstance(value, bool):
+            core = f"{column} -> %s {op} to_jsonb(%s::boolean)"
+            core_params = [key, value]
+        elif isinstance(value, (int, float)):
+            core = (
+                f"jsonb_typeof({column} -> %s) = 'number' "
+                f"AND {column} -> %s {op} to_jsonb(%s::numeric)"
+            )
+            core_params = [key, key, value]
+        else:
+            core = (
+                f"jsonb_typeof({column} -> %s) = 'string' "
+                f"AND {column} ->> %s {op} %s"
+            )
+            core_params = [key, key, value]
+
+        if negate:
+            clauses.append(f"(COALESCE({core}, false) = false)")
+        else:
+            clauses.append(f"({core})")
+        params.extend(core_params)
+
+    return clauses, params
+
+
 def extract_json_params(param_value: str, required_key: str) -> tuple[str, str | None, str | None]:
     """
     Extract content, labels, and source from JSON-embedded parameter (Grok workaround).
@@ -581,7 +807,8 @@ def extract_json_params(param_value: str, required_key: str) -> tuple[str, str |
         # Not valid JSON, treat as normal string
         return param_value, None, None
 
-def store_memory(content: str, labels: str = None, source: str = None, mcp_settings: dict = None) -> dict:
+def store_memory(content: str, labels: str = None, source: str = None,
+                 classifiers: str = None, mcp_settings: dict = None) -> dict:
     """
     Stores a memory in the database with duplicate detection.
     
@@ -631,6 +858,16 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
         logger.info(f"🏷️ Labels merged: {label_list} (appended from header: {append_labels})")
     else:
         logger.info(f"🔍 Debug - No labels to append (append_labels is empty)")
+    
+    # V8: Normalize and validate classifiers (caller-owned scalar map)
+    # Provided-but-empty is distinct from absent: '{}' means "classifier ran,
+    # found nothing", while absent leaves the column NULL - never classified.
+    classifiers_provided = classifiers is not None and str(classifiers).strip() != ''
+    classifier_map, classifier_error = normalize_classifiers(classifiers)
+    if classifier_error:
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({"error": classifier_error})
+        return add_performance_to_response(response, 0.0, 0.0, total_time)
     
     # Validate source: reject commas (reserved for multi-source filtering in retrieve)
     if source is not None and ',' in source:
@@ -718,8 +955,8 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
         initial_state['related'] = related_memories_data
     
     cur.execute(
-        """INSERT INTO memories (content_id, content, namespace, labels, source, enc, state)
-        VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id;""",
+        """INSERT INTO memories (content_id, content, namespace, labels, source, enc, state, classifiers)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;""",
         (
             next_content_id,
             content_bytes,
@@ -727,7 +964,8 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
             psycopg2.extras.Json(label_list),
             source,
             is_encrypted,
-            psycopg2.extras.Json(initial_state)
+            psycopg2.extras.Json(initial_state),
+            psycopg2.extras.Json(classifier_map) if classifiers_provided else None
         )
     )
     memory_id = cur.fetchone()[0]
@@ -788,6 +1026,10 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
         "message": f"✅ Memory stored with ID {display_id}" + (" 🔐" if is_encrypted else "")
     }
     
+    # V8: Echo classifiers back when the caller supplied any
+    if classifiers_provided and classifier_map:
+        result["classifiers"] = classifier_map
+    
     # V9: Unified related_memories format (consistent with retrieve_memories/get_memory)
     # Always include related_memories - empty array when none found
     result["related_memories"] = formatted_related
@@ -797,7 +1039,8 @@ def store_memory(content: str, labels: str = None, source: str = None, mcp_setti
     result = add_timezone_to_response(result)
     return add_performance_to_response(result, embedding_time, db_time, total_time)
 
-def retrieve_memories(query: str = None, labels: str = None, source: str = None, num_results: int = 5) -> dict:
+def retrieve_memories(query: str = None, labels: str = None, source: str = None,
+                      classifiers: str = None, num_results: int = 5) -> dict:
     """
     Retrieve memories with flexible filtering combinations.
     
@@ -814,6 +1057,10 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
     6. Labels + Source: Filter by both, return most recent
     7. Query + Labels + Source: Semantic search filtered by both labels AND source
     8. None (no parameters): Return most recent N memories ordered by timestamp DESC
+
+    V8 Classifiers:
+    Any of the above can be narrowed further with an exact-match classifier
+    filter - see parse_classifiers_filter() for the grammar.
     """
     # Performance timing
     total_start = time.time()
@@ -838,6 +1085,13 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
     
     # Parse source with exclusion support (! prefix, comma-separated)
     include_sources, exclude_sources = parse_source_with_exclusions(source)
+    
+    # V8: Parse classifier filters (exact match, ! prefix excludes and fails open)
+    classifier_filters, classifier_error = parse_classifiers_filter(classifiers)
+    if classifier_error:
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({"error": classifier_error})
+        return add_performance_to_response(response, 0.0, 0.0, total_time)
     
     # No validation required - all parameters are optional
     # When no parameters provided, returns most recent memories
@@ -871,7 +1125,8 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
         # Build SQL query with JOIN to memories table
         sql = f"""
             SELECT m.id, m.content, e.embedding_model, m.namespace, m.labels, m.source, m.timestamp, 
-                   1 - (e.embedding <=> %s::vector) as similarity, m.enc, m.state, m.content_id
+                   1 - (e.embedding <=> %s::vector) as similarity, m.enc, m.state, m.content_id,
+                   m.classifiers
             FROM memories m
             JOIN {table_name} e ON m.id = e.memory_id
         """
@@ -919,6 +1174,12 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
         for src in exclude_sources:
             where_clauses.append("NOT m.source ILIKE %s")
             params.append(f"%{src}%")
+        
+        # V8: Classifier filtering (exact match, AND-combined)
+        if classifier_filters:
+            cls_clauses, cls_params = build_classifiers_sql(classifier_filters, "m.classifiers")
+            where_clauses.extend(cls_clauses)
+            params.extend(cls_params)
         
         if where_clauses:
             sql += " WHERE " + " AND ".join(where_clauses)
@@ -968,6 +1229,10 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
             if related:
                 memory["related_memories"] = format_related_for_display(related, cur)
             
+            # V8: Add classifiers if the memory has been classified
+            if row[11]:
+                memory["classifiers"] = row[11]
+            
             memory["meta"] = {
                 "timestamp": timestamp_iso,
                 "embedding_model": row[2],
@@ -983,7 +1248,8 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
         # This works regardless of embedding model changes!
         
         sql = """
-            SELECT id, content, namespace, labels, source, timestamp, enc, state, content_id
+            SELECT id, content, namespace, labels, source, timestamp, enc, state, content_id,
+                   classifiers
             FROM memories
         """
         
@@ -1026,6 +1292,12 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
         for src in exclude_sources:
             where_clauses.append("NOT source ILIKE %s")
             params.append(f"%{src}%")
+        
+        # V8: Classifier filtering (exact match, AND-combined)
+        if classifier_filters:
+            cls_clauses, cls_params = build_classifiers_sql(classifier_filters, "classifiers")
+            where_clauses.extend(cls_clauses)
+            params.extend(cls_params)
         
         if where_clauses:
             sql += " WHERE " + " AND ".join(where_clauses)
@@ -1073,6 +1345,10 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
             related = state.get('related', [])
             if related:
                 memory["related_memories"] = format_related_for_display(related, cur)
+            
+            # V8: Add classifiers if the memory has been classified
+            if row[9]:
+                memory["classifiers"] = row[9]
             
             # For non-semantic queries, we don't have embedding info from the query
             memory["meta"] = {
@@ -1300,7 +1576,8 @@ def get_memory(memory_id: int) -> dict:
         # Query memories table directly (source of truth)
         # Note: resolve_memory_id already verified namespace access for namespaced mode
         select_sql = """
-            SELECT id, content, namespace, labels, source, timestamp, enc, state, content_id
+            SELECT id, content, namespace, labels, source, timestamp, enc, state, content_id,
+                   classifiers
             FROM memories
             WHERE id = %s;
         """
@@ -1349,6 +1626,10 @@ def get_memory(memory_id: int) -> dict:
             related = state.get('related', [])
             if related:
                 memory["related_memories"] = format_related_for_display(related, cur)
+            
+            # V8: Add classifiers if the memory has been classified
+            if result[9]:
+                memory["classifiers"] = result[9]
             
             # Add meta
             memory["meta"] = {
@@ -1425,7 +1706,8 @@ def random_memory(labels: str = None, source: str = None) -> dict:
     try:
         # Query memories table directly (source of truth)
         sql = """
-            SELECT id, content, namespace, labels, source, timestamp, enc, state, content_id
+            SELECT id, content, namespace, labels, source, timestamp, enc, state, content_id,
+                   classifiers
             FROM memories
         """
         
@@ -1512,6 +1794,10 @@ def random_memory(labels: str = None, source: str = None) -> dict:
             related = state.get('related', [])
             if related:
                 memory["related_memories"] = format_related_for_display(related, cur)
+            
+            # V8: Add classifiers if the memory has been classified
+            if result[9]:
+                memory["classifiers"] = result[9]
             
             # Add meta
             memory["meta"] = {
@@ -1666,7 +1952,7 @@ def add_labels(memory_id: int, labels: str) -> dict:
         cur.close()
         conn.close()
 
-def memory_stats(labels: str = None, source: str = None) -> dict:
+def memory_stats(labels: str = None, source: str = None, classifiers: str = None) -> dict:
     """
     Return memory statistics for the configured namespace(s).
     
@@ -1675,10 +1961,12 @@ def memory_stats(labels: str = None, source: str = None) -> dict:
     2. labels parameter: Count memories with matching labels (fuzzy)
     3. source parameter: Count memories from matching source (fuzzy)
     4. labels + source: Count memories matching both filters
+    5. classifiers parameter: Count memories matching an exact classifier filter
     
     Args:
         labels: Optional filter for labels (fuzzy match, comma-separated). Use ! prefix to exclude.
         source: Optional source filter (fuzzy match). Use ! prefix to exclude.
+        classifiers: Optional classifier filter (exact match). See parse_classifiers_filter().
         
     Returns:
         Statistics including total count, matching count, percentage,
@@ -1697,6 +1985,13 @@ def memory_stats(labels: str = None, source: str = None) -> dict:
     
     # Parse source with exclusion support (! prefix, comma-separated)
     include_sources, exclude_sources = parse_source_with_exclusions(source)
+    
+    # V8: Parse classifier filters (exact match, ! prefix excludes and fails open)
+    classifier_filters, classifier_error = parse_classifiers_filter(classifiers)
+    if classifier_error:
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({"error": classifier_error})
+        return add_performance_to_response(response, 0.0, 0.0, total_time)
     
     # Database operations (timed)
     db_start = time.time()
@@ -1720,7 +2015,8 @@ def memory_stats(labels: str = None, source: str = None) -> dict:
         total_count = cur.fetchone()[0]
         
         # If no filters, return simple total
-        if not include_labels and not exclude_labels and not include_sources and not exclude_sources:
+        if (not include_labels and not exclude_labels and not include_sources
+                and not exclude_sources and not classifier_filters):
             db_time = time.time() - db_start
             total_time = time.time() - total_start
             response = add_timezone_to_response({
@@ -1763,6 +2059,12 @@ def memory_stats(labels: str = None, source: str = None) -> dict:
         for src in exclude_sources:
             filter_where.append("NOT source ILIKE %s")
             filter_params.append(f"%{src}%")
+        
+        # V8: Classifier filtering (exact match, AND-combined)
+        if classifier_filters:
+            cls_clauses, cls_params = build_classifiers_sql(classifier_filters, "classifiers")
+            filter_where.extend(cls_clauses)
+            filter_params.extend(cls_params)
         
         filter_where_sql = " WHERE " + " AND ".join(filter_where) if filter_where else ""
         
@@ -2311,6 +2613,219 @@ def replace_labels(memory_id: int, target: str, new: str) -> dict:
         response = add_timezone_to_response({
             "success": False,
             "error": f"❌ Error replacing labels: {str(e)}"
+        })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
+    finally:
+        cur.close()
+        conn.close()
+
+
+def set_classifiers(memory_id: int, classifiers: str, merge: bool = True) -> dict:
+    """
+    Set or merge classifier values on an existing memory.
+
+    Classifiers are caller-owned: this server stores the scalars and compares
+    them when filtering, and never decides what they mean. Populating them is
+    the job of whatever does the classifying - a decision model, a script, or
+    an AI buddy.
+
+    V6 Namespace ID Handling:
+    - Wildcard namespace: memory_id is the real database ID
+    - Specific namespace: memory_id is content_id, resolved to real ID
+
+    Args:
+        memory_id: The memory to update
+        classifiers: JSON object, or compact "key=value,key=value"
+        merge: True merges into existing keys (default), False replaces the map
+
+    Returns:
+        Success status and the resulting classifiers map
+    """
+    total_start = time.time()
+    embedding_time = 0.0  # No embedding for set_classifiers
+    db_time = 0.0
+
+    namespace = NAMESPACE if NAMESPACE is not None else "default"
+    user_facing_id = memory_id
+
+    new_values, error = normalize_classifiers(classifiers)
+    if error:
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({"success": False, "error": error})
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
+
+    if not new_values and merge:
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({
+            "success": False,
+            "error": "❌ No classifiers provided. Pass merge=false to clear them instead."
+        })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
+
+    # Resolve user-facing ID to real database ID
+    real_id, error = resolve_memory_id(memory_id, namespace)
+    if error:
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({"success": False, "error": error})
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
+
+    memory_id = real_id
+
+    db_start = time.time()
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT classifiers FROM memories WHERE id = %s;", (memory_id,))
+        row = cur.fetchone()
+        if row is None:
+            db_time = time.time() - db_start
+            total_time = time.time() - total_start
+            response = add_timezone_to_response({
+                "success": False,
+                "error": f"❌ Memory #{user_facing_id} not found"
+            })
+            return add_performance_to_response(response, embedding_time, db_time, total_time)
+
+        existing = row[0] if row[0] else {}
+
+        if merge:
+            merged = dict(existing)
+            merged.update(new_values)
+        else:
+            merged = new_values
+
+        cur.execute(
+            """UPDATE memories SET classifiers = %s WHERE id = %s;""",
+            (psycopg2.extras.Json(merged), memory_id)
+        )
+        conn.commit()
+        db_time = time.time() - db_start
+        total_time = time.time() - total_start
+
+        verb = "merged into" if merge else "set on"
+        response = add_timezone_to_response({
+            "success": True,
+            "message": f"✅ Classifiers {verb} memory #{user_facing_id}",
+            "classifiers": merged
+        })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
+
+    except Exception as e:
+        conn.rollback()
+        db_time = time.time() - db_start
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({
+            "success": False,
+            "error": f"❌ Error setting classifiers: {str(e)}"
+        })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
+    finally:
+        cur.close()
+        conn.close()
+
+
+def del_classifiers(memory_id: int, keys: str) -> dict:
+    """
+    Remove classifier keys from an existing memory.
+
+    Removing every key leaves an empty map rather than NULL, so the memory is
+    picked up again by a "key absent" filter - which is how a classifier
+    worker finds work to do.
+
+    Args:
+        memory_id: The memory to update
+        keys: Comma-separated key names, or a JSON array of key names
+
+    Returns:
+        Success status and the remaining classifiers map
+    """
+    total_start = time.time()
+    embedding_time = 0.0  # No embedding for del_classifiers
+    db_time = 0.0
+
+    namespace = NAMESPACE if NAMESPACE is not None else "default"
+    user_facing_id = memory_id
+
+    # Key names accept the same shapes as labels: JSON array or comma-separated
+    target_keys = normalize_labels(keys)
+    if not target_keys:
+        try:
+            parsed = json.loads(keys) if isinstance(keys, str) else keys
+            if isinstance(parsed, list):
+                target_keys = normalize_labels(parsed)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            target_keys = []
+
+    if not target_keys:
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({
+            "success": False,
+            "error": "❌ No classifier keys provided"
+        })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
+
+    real_id, error = resolve_memory_id(memory_id, namespace)
+    if error:
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({"success": False, "error": error})
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
+
+    memory_id = real_id
+
+    db_start = time.time()
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT classifiers FROM memories WHERE id = %s;", (memory_id,))
+        row = cur.fetchone()
+        if row is None:
+            db_time = time.time() - db_start
+            total_time = time.time() - total_start
+            response = add_timezone_to_response({
+                "success": False,
+                "error": f"❌ Memory #{user_facing_id} not found"
+            })
+            return add_performance_to_response(response, embedding_time, db_time, total_time)
+
+        existing = row[0] if row[0] else {}
+        remaining = {k: v for k, v in existing.items() if k not in target_keys}
+        removed = [k for k in target_keys if k in existing]
+
+        if not removed:
+            db_time = time.time() - db_start
+            total_time = time.time() - total_start
+            response = add_timezone_to_response({
+                "success": False,
+                "error": f"❌ None of those classifiers are set on memory #{user_facing_id}",
+                "classifiers": existing
+            })
+            return add_performance_to_response(response, embedding_time, db_time, total_time)
+
+        cur.execute(
+            """UPDATE memories SET classifiers = %s WHERE id = %s;""",
+            (psycopg2.extras.Json(remaining), memory_id)
+        )
+        conn.commit()
+        db_time = time.time() - db_start
+        total_time = time.time() - total_start
+
+        response = add_timezone_to_response({
+            "success": True,
+            "message": f"✅ Removed {len(removed)} classifier(s) from memory #{user_facing_id}",
+            "removed": removed,
+            "classifiers": remaining
+        })
+        return add_performance_to_response(response, embedding_time, db_time, total_time)
+
+    except Exception as e:
+        conn.rollback()
+        db_time = time.time() - db_start
+        total_time = time.time() - total_start
+        response = add_timezone_to_response({
+            "success": False,
+            "error": f"❌ Error removing classifiers: {str(e)}"
         })
         return add_performance_to_response(response, embedding_time, db_time, total_time)
     finally:

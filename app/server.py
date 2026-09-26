@@ -368,6 +368,7 @@ def register_tools(mcp: FastMCP) -> None:
         content: str,
         labels: str | None = None,
         source: str | None = None,
+        classifiers: str | None = None,
     ) -> dict[str, Any]:
         """
         Store a conversation memory for later retrieval.
@@ -376,11 +377,14 @@ def register_tools(mcp: FastMCP) -> None:
             content: The conversation content or summary to remember
             labels: Optional comma-separated labels for categorizing the memory
             source: Optional source attribution (e.g., 'Wikipedia', 'user')
+            classifiers: Optional classifier scores as a JSON object or "key=value,key=value".
+                Values must be scalars (number, boolean, string or null); nested objects are
+                rejected. Omit to leave the memory unclassified.
             
         Returns:
             Result with success status and memory ID
         """
-        return tools.store_memory(content, labels, source)
+        return tools.store_memory(content, labels, source, classifiers)
     
     @mcp.tool(
         annotations={
@@ -394,6 +398,7 @@ def register_tools(mcp: FastMCP) -> None:
         query: str | None = None,
         labels: str | None = None,
         source: str | None = None,
+        classifiers: str | None = None,
         num_results: int = 5,
     ) -> dict[str, Any]:
         """
@@ -408,17 +413,19 @@ def register_tools(mcp: FastMCP) -> None:
         - Labels + Source: Filter by both, return most recent
         - Query + Labels + Source: Semantic search with all filters
         - No parameters: Return most recent N memories
+        - Any of the above + classifiers: narrowed by exact classifier match
         
         Args:
             query: Optional query text for semantic search (uses embeddings)
             labels: Optional comma-separated labels for filtering (fuzzy match). Use ! prefix to exclude (e.g., 'beer,!wine')
             source: Optional source filter (fuzzy match). Use ! prefix to exclude (e.g., '!clawdbot')
+            classifiers: Optional exact-match classifier filter, comma-separated and AND-combined. 'is_task' = key present, '!is_task' = key absent, 'is_task>=0.7' = numeric threshold (strict), '!is_greeting>=0.5' = exclude matches (unclassified memories still pass), 'team=payments' = string match
             num_results: Number of results to return (default: 5)
             
         Returns:
             List of matching memories (with similarity scores if query provided)
         """
-        return tools.retrieve_memories(query, labels, source, num_results)
+        return tools.retrieve_memories(query, labels, source, classifiers, num_results)
     
     @mcp.tool(
         annotations={
@@ -505,6 +512,70 @@ def register_tools(mcp: FastMCP) -> None:
     
     @mcp.tool(
         annotations={
+            "title": "Set classifiers on a memory",
+            "readOnlyHint": False,
+            "openWorldHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True
+        }
+    )
+    @validation_error_handler
+    async def set_classifiers(
+        memory_id: int,
+        classifiers: str,
+        merge: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Set or merge classifier scores on an existing memory.
+        
+        Classifiers are caller-owned: this server stores the values and compares them
+        when filtering, and never decides what they mean. Use this to attach verdicts
+        produced out of band, so classification adds no latency to the stored turn.
+        
+        Args:
+            memory_id: The unique ID of the memory
+            classifiers: JSON object, or compact "key=value,key=value". Values must be
+                scalars (number, boolean, string or null); nested objects are rejected.
+                A null value marks "classifier ran, abstained" - the key is present, so
+                exclusion filters skip the memory and no threshold can ever match it.
+            merge: True merges into existing keys (default), False replaces the whole map
+            
+        Returns:
+            Result with success status and the resulting classifiers
+        """
+        return tools.set_classifiers(memory_id, classifiers, merge)
+    
+    @mcp.tool(
+        annotations={
+            "title": "Remove classifiers from a memory",
+            "readOnlyHint": False,
+            "openWorldHint": False,
+            "destructiveHint": True,
+            "idempotentHint": True
+        }
+    )
+    @validation_error_handler
+    async def del_classifiers(
+        memory_id: int,
+        keys: str,
+    ) -> dict[str, Any]:
+        """
+        Remove classifier keys from an existing memory.
+        
+        Removing every key leaves an empty map, so the memory is picked up again by a
+        "key absent" filter - which is how a classifier worker finds work to do.
+        
+        Args:
+            memory_id: The unique ID of the memory
+            keys: Key names to remove (comma-separated string or JSON array)
+            
+        Returns:
+            Result with success status and the remaining classifiers
+        """
+        return tools.del_classifiers(memory_id, keys)
+    
+    @mcp.tool(
+        annotations={
             "title": "Delete memory by ID",
             "readOnlyHint": False,
             "openWorldHint": False,
@@ -584,6 +655,7 @@ def register_tools(mcp: FastMCP) -> None:
     async def memory_stats(
         labels: str | None = None,
         source: str | None = None,
+        classifiers: str | None = None,
     ) -> dict[str, Any]:
         """
         Return memory statistics for the configured namespace(s).
@@ -592,16 +664,18 @@ def register_tools(mcp: FastMCP) -> None:
         - No parameters: Return total memory count
         - labels: Count memories with matching labels (fuzzy match)
         - source: Count memories from matching source (fuzzy match)
+        - classifiers: Count memories matching an exact classifier filter
         
         Args:
             labels: Optional filter for labels (fuzzy match, comma-separated). Use ! prefix to exclude (e.g., 'beer,!wine')
             source: Optional source filter (fuzzy match). Use ! prefix to exclude (e.g., '!clawdbot')
+            classifiers: Optional exact-match classifier filter, comma-separated and AND-combined. 'is_task' = key present, '!is_task' = key absent, 'is_task>=0.7' = numeric threshold (strict), '!is_greeting>=0.5' = exclude matches (unclassified memories still pass), 'team=payments' = string match
             
         Returns:
             Statistics including total count, matching count, percentage,
             and list of matched labels/sources (labels_matched, sources_matched)
         """
-        return tools.memory_stats(labels, source)
+        return tools.memory_stats(labels, source, classifiers)
     
     @mcp.tool(
         annotations={
@@ -634,7 +708,16 @@ def register_tools(mcp: FastMCP) -> None:
         """
         return tools.trending_labels(days, limit)
     
-    logger.info(f"🛠️ Registered 10 tools: store_memory, retrieve_memories, add_labels, del_labels, replace_labels, delete_memory, get_memory, random_memory, memory_stats, trending_labels")
+    # Keep in sync with the tools registered above; the count is derived so it
+    # cannot drift from the list the way a hardcoded total does.
+    registered_tools = [
+        "store_memory", "retrieve_memories",
+        "add_labels", "del_labels", "replace_labels",
+        "set_classifiers", "del_classifiers",
+        "delete_memory", "get_memory", "random_memory",
+        "memory_stats", "trending_labels",
+    ]
+    logger.info(f"🛠️ Registered {len(registered_tools)} tools: {', '.join(registered_tools)}")
 
 
 def main():
