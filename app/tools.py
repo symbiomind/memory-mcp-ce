@@ -677,7 +677,39 @@ def _coerce_classifier_value(raw: str) -> Any:
         return text
 
 
-def normalize_classifiers(classifiers_value: Any) -> tuple[Dict[str, Any], str | None]:
+def _quoted_value_warnings(key: str, value: Any) -> List[str]:
+    """
+    Note a compact-form value that kept its own quote marks.
+
+    "banana_cows=\"real\"" stores the five characters '"real"', not 'real', so
+    a later filter for 'banana_cows=real' misses it - the compact grammar has no
+    quoting, values are taken literally. Legitimate often enough to store and
+    never to rewrite, odd often enough to mention.
+
+    The escaped sibling is the same mistake arriving by imitation, and is the
+    one place '&quot;' in recalled memory text reaches something that matters:
+    "banana_cows=&quot;real&quot;" stores twelve characters around a four-letter
+    word.
+    """
+    if not isinstance(value, str):
+        return []
+
+    for opener, closer in (('"', '"'), ("'", "'"), ('&quot;', '&quot;')):
+        if (len(value) > len(opener) + len(closer) - 1
+                and value.startswith(opener) and value.endswith(closer)):
+            bare = value[len(opener):-len(closer)]
+            if bare:
+                return [
+                    f"⚠️ Classifier '{key}' was stored as {value!r}, with the quote "
+                    f"marks as part of the value - the compact key=value form has no "
+                    f"quoting. A filter for '{key}={value}' matches it; one for "
+                    f"'{key}={bare}' does not. Omit the quotes to store {bare!r}."
+                ]
+
+    return []
+
+
+def normalize_classifiers(classifiers_value: Any) -> tuple[Dict[str, Any], str | None, List[str]]:
     """
     Normalize classifiers into a flat dict of JSON scalars.
 
@@ -695,17 +727,19 @@ def normalize_classifiers(classifiers_value: Any) -> tuple[Dict[str, Any], str |
     jsonb_typeof() guard means no numeric comparison can ever match it.
 
     Returns:
-        Tuple of (classifiers dict, error message or None)
+        Tuple of (classifiers dict, error message or None, warnings)
     """
+    warnings: List[str] = []
+
     if classifiers_value is None:
-        return {}, None
+        return {}, None, warnings
 
     raw: Any = classifiers_value
 
     if isinstance(raw, str):
         text = raw.strip()
         if not text:
-            return {}, None
+            return {}, None, warnings
         try:
             parsed = json.loads(text)
         except (json.JSONDecodeError, ValueError):
@@ -716,29 +750,31 @@ def normalize_classifiers(classifiers_value: Any) -> tuple[Dict[str, Any], str |
                 if not pair:
                     continue
                 if '=' not in pair:
-                    return {}, f"❌ Classifier '{pair}' is not key=value. Use JSON or \"key=value,key=value\"."
+                    return {}, f"❌ Classifier '{pair}' is not key=value. Use JSON or \"key=value,key=value\".", warnings
                 key, _, value = pair.partition('=')
-                parsed[key.strip()] = _coerce_classifier_value(value)
+                key = key.strip()
+                parsed[key] = _coerce_classifier_value(value)
+                warnings.extend(_quoted_value_warnings(key, parsed[key]))
         raw = parsed
 
     if not isinstance(raw, dict):
-        return {}, "❌ Classifiers must be a JSON object of key/value pairs."
+        return {}, "❌ Classifiers must be a JSON object of key/value pairs.", warnings
 
     cleaned: Dict[str, Any] = {}
     for key, value in raw.items():
         if not isinstance(key, str):
-            return {}, f"❌ Classifier key {key!r} must be a string."
+            return {}, f"❌ Classifier key {key!r} must be a string.", warnings
         key = key.strip()
         if not key:
-            return {}, "❌ Classifier keys cannot be empty."
+            return {}, "❌ Classifier keys cannot be empty.", warnings
         if len(key) > 255:
-            return {}, f"❌ Classifier key '{key[:32]}...' exceeds 255 characters."
+            return {}, f"❌ Classifier key '{key[:32]}...' exceeds 255 characters.", warnings
         for char in _CLASSIFIER_RESERVED:
             if char in key:
                 return {}, (
                     f"❌ Classifier key '{key}' cannot contain '{char}'. "
                     f"Reserved for filter syntax: {' '.join(_CLASSIFIER_RESERVED)}"
-                )
+                ), warnings
         # The same rule, applied to the escaped spelling of a reserved
         # character. Without this, 'is_task>=0.7' is rejected for the '>' in its
         # key while 'is_task&gt;=0.7' is stored as a key named 'is_task&gt;' -
@@ -757,21 +793,21 @@ def normalize_classifiers(classifiers_value: Any) -> tuple[Dict[str, Any], str |
                         f"syntax: {' '.join(_CLASSIFIER_RESERVED)}. Classifiers are "
                         f"stored as key=value only - there are no comparison "
                         f"operators on this side, so nothing here needs escaping."
-                    )
+                    ), warnings
         if isinstance(value, bool) or value is None or isinstance(value, str):
             cleaned[key] = value
         elif isinstance(value, (int, float)):
             if isinstance(value, float) and (value != value or value in (float('inf'), float('-inf'))):
-                return {}, f"❌ Classifier '{key}' must be a finite number (got {value})."
+                return {}, f"❌ Classifier '{key}' must be a finite number (got {value}).", warnings
             cleaned[key] = value
         else:
             return {}, (
                 f"❌ Classifier '{key}' must be a number, boolean, string or null - "
                 f"got {type(value).__name__}. Flatten nested values caller-side "
                 f"(e.g. \"team.confidence\": 0.67); this server stores one level only."
-            )
+            ), warnings
 
-    return cleaned, None
+    return cleaned, None, warnings
 
 
 def parse_classifiers_filter(
@@ -960,7 +996,7 @@ def build_classifiers_sql(filters: List[dict], column: str = "classifiers") -> t
     return clauses, params
 
 
-def extract_json_params(param_value: str, required_key: str) -> tuple[str, str | None, str | None]:
+def extract_json_params(param_value: str, required_key: str) -> tuple[str, str | None, str | None, List[str]]:
     """
     Extract content, labels, and source from JSON-embedded parameter (Grok workaround).
     
@@ -969,16 +1005,21 @@ def extract_json_params(param_value: str, required_key: str) -> tuple[str, str |
         required_key: The required key to extract (e.g., 'content' or 'query')
     
     Returns:
-        Tuple of (extracted_value, labels_or_none, source_or_none)
+        Tuple of (extracted_value, labels_or_none, source_or_none, warnings)
         - If valid JSON with required key: returns (extracted_value, optional_labels, optional_source)
         - If not valid JSON or missing required key: returns (original_param_value, None, None)
+
+    The unwrap used to be entirely silent, which is fine for the caller it was
+    written for and confusing for anyone else who passes a JSON-looking string
+    and gets a different value stored than the one they sent. It now reports
+    what it took, through the same advisory channel as the classifier filter.
     """
     # Trim whitespace
     trimmed = param_value.strip()
     
     # Check if it looks like JSON (starts with { and ends with })
     if not (trimmed.startswith('{') and trimmed.endswith('}')):
-        return param_value, None, None
+        return param_value, None, None, []
     
     # Try to parse as JSON
     try:
@@ -986,22 +1027,32 @@ def extract_json_params(param_value: str, required_key: str) -> tuple[str, str |
         
         # Must be a dict
         if not isinstance(parsed, dict):
-            return param_value, None, None
+            return param_value, None, None, []
         
         # Check for required key
         if required_key not in parsed:
-            return param_value, None, None
+            return param_value, None, None, []
         
         # Extract the required value, optional labels, AND optional source
         extracted_value = parsed[required_key]
         extracted_labels = parsed.get('labels')
         extracted_source = parsed.get('source')
-        
-        return extracted_value, extracted_labels, extracted_source
+
+        taken = [required_key] + [k for k in ('labels', 'source') if parsed.get(k) is not None]
+        ignored = [k for k in parsed if k not in ('labels', 'source') and k != required_key]
+        note = (
+            f"⚠️ The '{required_key}' parameter held a JSON object and was unwrapped: "
+            f"took {', '.join(taken)}."
+        )
+        if ignored:
+            note += f" Ignored {', '.join(sorted(ignored))}."
+        note += f" Pass '{required_key}' as a plain string and the others as their own parameters."
+
+        return extracted_value, extracted_labels, extracted_source, [note]
         
     except (json.JSONDecodeError, ValueError):
         # Not valid JSON, treat as normal string
-        return param_value, None, None
+        return param_value, None, None, []
 
 def store_memory(content: str, labels: str = None, source: str = None,
                  classifiers: str = None, mcp_settings: dict = None) -> dict:
@@ -1018,8 +1069,13 @@ def store_memory(content: str, labels: str = None, source: str = None,
     embedding_time = 0.0
     db_time = 0.0
     
+    # Advisory notes for the caller, collected as they are noticed and attached
+    # to whichever reply this call ends up returning.
+    tool_warnings: List[str] = []
+
     # Extract JSON-embedded parameters (Grok workaround)
-    extracted_content, extracted_labels, extracted_source = extract_json_params(content, 'content')
+    extracted_content, extracted_labels, extracted_source, unwrap_warnings = extract_json_params(content, 'content')
+    tool_warnings.extend(unwrap_warnings)
     
     # Use extracted values if found in JSON, otherwise use the original parameters
     if extracted_labels is not None:
@@ -1059,10 +1115,11 @@ def store_memory(content: str, labels: str = None, source: str = None,
     # Provided-but-empty is distinct from absent: '{}' means "classifier ran,
     # found nothing", while absent leaves the column NULL - never classified.
     classifiers_provided = classifiers is not None and str(classifiers).strip() != ''
-    classifier_map, classifier_error = normalize_classifiers(classifiers)
+    classifier_map, classifier_error, classifier_warnings = normalize_classifiers(classifiers)
+    tool_warnings.extend(classifier_warnings)
     if classifier_error:
         total_time = time.time() - total_start
-        response = add_timezone_to_response({"error": classifier_error})
+        response = add_timezone_to_response({"error": classifier_error}, tool_warnings)
         return add_performance_to_response(response, 0.0, 0.0, total_time)
     
     # Validate source: reject commas (reserved for multi-source filtering in retrieve)
@@ -1070,7 +1127,7 @@ def store_memory(content: str, labels: str = None, source: str = None,
         total_time = time.time() - total_start
         response = add_timezone_to_response({
             "error": "❌ Source cannot contain commas. Commas are reserved for multi-source filtering in retrieve_memories."
-        })
+        }, tool_warnings)
         return add_performance_to_response(response, 0.0, 0.0, total_time)
     
     # Auto-populate from config
@@ -1232,7 +1289,7 @@ def store_memory(content: str, labels: str = None, source: str = None,
     
     # Add performance metrics and timezone
     total_time = time.time() - total_start
-    result = add_timezone_to_response(result)
+    result = add_timezone_to_response(result, tool_warnings)
     return add_performance_to_response(result, embedding_time, db_time, total_time)
 
 def retrieve_memories(query: str = None, labels: str = None, source: str = None,
@@ -1263,9 +1320,13 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
     embedding_time = 0.0
     db_time = 0.0
     
+    # Advisory notes for the caller, collected as they are noticed.
+    tool_warnings: List[str] = []
+
     # Extract JSON-embedded parameters (Grok workaround) - only if query is provided
     if query is not None and isinstance(query, str) and query.strip():
-        extracted_query, extracted_labels, extracted_source = extract_json_params(query, 'query')
+        extracted_query, extracted_labels, extracted_source, unwrap_warnings = extract_json_params(query, 'query')
+        tool_warnings.extend(unwrap_warnings)
         
         # Use extracted values if found in JSON, otherwise use the original parameters
         if extracted_labels is not None:
@@ -1284,9 +1345,10 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
     
     # V8: Parse classifier filters (exact match, ! prefix excludes and fails open)
     classifier_filters, classifier_error, classifier_warnings = parse_classifiers_filter(classifiers)
+    tool_warnings.extend(classifier_warnings)
     if classifier_error:
         total_time = time.time() - total_start
-        response = add_timezone_to_response({"error": classifier_error})
+        response = add_timezone_to_response({"error": classifier_error}, tool_warnings)
         return add_performance_to_response(response, 0.0, 0.0, total_time)
     
     # No validation required - all parameters are optional
@@ -1587,7 +1649,7 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
     
     # Add performance metrics and timezone
     total_time = time.time() - total_start
-    response = add_timezone_to_response(response, classifier_warnings)
+    response = add_timezone_to_response(response, tool_warnings)
     return add_performance_to_response(response, embedding_time, db_time, total_time)
 
 def delete_memory(memory_id: int) -> dict:
@@ -2844,10 +2906,10 @@ def set_classifiers(memory_id: int, classifiers: str, merge: bool = True) -> dic
     namespace = NAMESPACE if NAMESPACE is not None else "default"
     user_facing_id = memory_id
 
-    new_values, error = normalize_classifiers(classifiers)
+    new_values, error, tool_warnings = normalize_classifiers(classifiers)
     if error:
         total_time = time.time() - total_start
-        response = add_timezone_to_response({"success": False, "error": error})
+        response = add_timezone_to_response({"success": False, "error": error}, tool_warnings)
         return add_performance_to_response(response, embedding_time, db_time, total_time)
 
     if not new_values and merge:
@@ -2855,14 +2917,14 @@ def set_classifiers(memory_id: int, classifiers: str, merge: bool = True) -> dic
         response = add_timezone_to_response({
             "success": False,
             "error": "❌ No classifiers provided. Pass merge=false to clear them instead."
-        })
+        }, tool_warnings)
         return add_performance_to_response(response, embedding_time, db_time, total_time)
 
     # Resolve user-facing ID to real database ID
     real_id, error = resolve_memory_id(memory_id, namespace)
     if error:
         total_time = time.time() - total_start
-        response = add_timezone_to_response({"success": False, "error": error})
+        response = add_timezone_to_response({"success": False, "error": error}, tool_warnings)
         return add_performance_to_response(response, embedding_time, db_time, total_time)
 
     memory_id = real_id
@@ -2880,7 +2942,7 @@ def set_classifiers(memory_id: int, classifiers: str, merge: bool = True) -> dic
             response = add_timezone_to_response({
                 "success": False,
                 "error": f"❌ Memory #{user_facing_id} not found"
-            })
+            }, tool_warnings)
             return add_performance_to_response(response, embedding_time, db_time, total_time)
 
         # Defensive: '!*' surfaces rows holding a non-object value (only
@@ -2907,7 +2969,7 @@ def set_classifiers(memory_id: int, classifiers: str, merge: bool = True) -> dic
             "success": True,
             "message": f"✅ Classifiers {verb} memory #{user_facing_id}",
             "classifiers": merged
-        })
+        }, tool_warnings)
         return add_performance_to_response(response, embedding_time, db_time, total_time)
 
     except Exception as e:
@@ -2917,7 +2979,7 @@ def set_classifiers(memory_id: int, classifiers: str, merge: bool = True) -> dic
         response = add_timezone_to_response({
             "success": False,
             "error": f"❌ Error setting classifiers: {str(e)}"
-        })
+        }, tool_warnings)
         return add_performance_to_response(response, embedding_time, db_time, total_time)
     finally:
         cur.close()
