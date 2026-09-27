@@ -11,8 +11,10 @@ from app.encryption import (
     decode_or_decrypt_content,
     should_include_memory,
 )
+import html
 import json
 import logging
+import re
 from typing import List, Dict, Any
 from datetime import datetime, timezone
 
@@ -302,28 +304,42 @@ def format_current_time() -> tuple[str, str] | tuple[None, None]:
     return formatted, tz_string
 
 
-def add_timezone_to_response(response: dict) -> dict:
+def add_timezone_to_response(response: dict, warnings: List[str] | None = None) -> dict:
     """
-    Add current_time and timezone fields to a response dict.
-    
+    Add warnings and the current_time/timezone fields to a response dict.
+
+    Warnings are the advisory channel: notes to the caller about how its own
+    input was read, for input that was accepted rather than rejected. An error
+    stops the call, a warning does not - so a warning is what fits the case
+    where the server understood something well enough to answer but suspects
+    the caller did not mean it.
+
+    They sit ABOVE the timezone block because ambient metadata is skimmable and
+    an advisory is the one field that must not be. The key is absent entirely
+    when there is nothing to say, so a correct call pays nothing for the
+    channel existing - which is also what keeps it worth reading.
+
     Args:
         response: The response dictionary to augment
-    
+        warnings: Optional advisory notes for the caller
+
     Returns:
-        Response dict with timezone info prepended (if enabled)
+        Response dict with warnings and timezone info prepended
     """
     current_time, tz_string = format_current_time()
-    
-    if current_time is None:
-        # Timezone feature disabled - return response unchanged
+
+    head: Dict[str, Any] = {}
+    if warnings:
+        head["warnings"] = list(warnings)
+    if current_time is not None:
+        head["current_time"] = current_time
+        head["timezone"] = tz_string
+
+    if not head:
+        # Nothing to say and the timezone feature is disabled
         return response
-    
-    # Create new dict with timezone fields first, then original response
-    return {
-        "current_time": current_time,
-        "timezone": tz_string,
-        **response
-    }
+
+    return {**head, **response}
 
 
 def format_performance(embedding_time: float, db_time: float, total_time: float) -> str:
@@ -538,14 +554,108 @@ def parse_source_with_exclusions(source: str | None) -> tuple[List[str], List[st
     
     return include_sources, exclude_sources
 
-# Operators supported in classifier filters. Two-character forms must be tried
-# first so that ">=" is not read as ">" followed by a stray "=".
-_CLASSIFIER_OPS = ('>=', '<=', '!=', '>', '<', '=')
+# Operators supported in classifier filters, as surface form -> canonical form.
+#
+# The escaped spellings are aliases, not a second grammar. Escaped text reaches
+# this parser when a caller has learnt its tool syntax by imitating recalled
+# memories: conversational memory wraps stored turns in <user>/<agent> tags and
+# entity-escapes the text inside them, which is correct XML serialization, so a
+# prose mention of "is_task>=0.7" comes back out of storage spelled
+# "is_task&gt;=0.7". A caller that copies what it reads then sends the escaped
+# form in a real call.
+#
+# Only '<' and '>' are both escaped by that path and meaningful in this
+# grammar, so the alias set is exactly these four - '&quot;' and '&amp;' are
+# escaped too but carry no meaning here, and decoding them would only put this
+# parser in the business of rewriting caller data.
+_CLASSIFIER_OP_ALIASES = {
+    '>=': '>=',
+    '<=': '<=',
+    '!=': '!=',
+    '>': '>',
+    '<': '<',
+    '=': '=',
+    '&gt;=': '>=',
+    '&lt;=': '<=',
+    '&gt;': '>',
+    '&lt;': '<',
+}
+
+# Named, decimal and hex character references. Used to recognise an escaped
+# spelling that the alias table above does not cover - a double escape
+# ('&amp;gt;'), a numeric reference ('&#62;'), anything future - so that it can
+# be reported rather than silently accepted as part of a key name.
+_HTML_ENTITY_RE = re.compile(r'&(?:#[0-9]+|#[xX][0-9a-fA-F]+|[A-Za-z][A-Za-z0-9]*);')
 
 # Characters that would make the filter grammar unparseable if they appeared
 # inside a classifier key. '*' is reserved because a bare '*' is the wildcard
 # state filter - a literal key named '*' would make the grammar ambiguous.
 _CLASSIFIER_RESERVED = (',', '!', '<', '>', '=', '*')
+
+
+def _find_classifier_op(part: str) -> tuple[int, str, str] | None:
+    """
+    Locate the operator in one filter term.
+
+    Leftmost match in the string, longest surface form at that position.
+
+    Leftmost matters because a string value may legitimately contain something
+    that looks like an operator: "note=a>=b" is an equality filter for the
+    value "a>=b", and reading it any other way loses the caller's data. Longest
+    form at that position is what keeps ">=" from being read as ">" with a
+    stray "=" left in the value.
+
+    Scanning a fixed operator list in precedence order instead - first form
+    found anywhere in the term - is subtly wrong for exactly that case, and was
+    why "note=a>=b" used to be rejected as a key named "note=a".
+
+    Returns:
+        (index, surface form, canonical form) or None when the term has no
+        operator - a bare presence filter. An operator at index 0 is not one:
+        there would be no key in front of it.
+    """
+    best: tuple[int, str, str] | None = None
+
+    for surface, canonical in _CLASSIFIER_OP_ALIASES.items():
+        idx = part.find(surface)
+        if idx <= 0:
+            continue
+        if best is None or idx < best[0] or (idx == best[0] and len(surface) > len(best[1])):
+            best = (idx, surface, canonical)
+
+    return best
+
+
+def format_classifiers_filter(filters: List[dict]) -> str:
+    """
+    Re-serialize parsed filters back into canonical filter syntax.
+
+    Built from the parsed structure rather than by substituting on the caller's
+    original string, so what comes back is exactly what the parser understood -
+    and can be pasted straight into the next call.
+    """
+    parts: List[str] = []
+
+    for f in filters:
+        prefix = '!' if f['negate'] else ''
+
+        if f.get('wildcard'):
+            parts.append(f"{prefix}*")
+            continue
+        if f['op'] is None:
+            parts.append(f"{prefix}{f['key']}")
+            continue
+
+        value = f['value']
+        if value is None:
+            text = 'null'
+        elif isinstance(value, bool):
+            text = 'true' if value else 'false'
+        else:
+            text = str(value)
+        parts.append(f"{prefix}{f['key']}{f['op']}{text}")
+
+    return ','.join(parts)
 
 
 def _coerce_classifier_value(raw: str) -> Any:
@@ -645,7 +755,9 @@ def normalize_classifiers(classifiers_value: Any) -> tuple[Dict[str, Any], str |
     return cleaned, None
 
 
-def parse_classifiers_filter(classifiers: str | None) -> tuple[List[dict], str | None]:
+def parse_classifiers_filter(
+    classifiers: str | None,
+) -> tuple[List[dict], str | None, List[str]]:
     """
     Parse a comma-separated classifier filter string.
 
@@ -662,14 +774,26 @@ def parse_classifiers_filter(classifiers: str | None) -> tuple[List[dict], str |
     OR-combined - classifier includes AND, because "is_task>=0.7,
     is_question>=0.7" meaning "either one" would be useless for thresholds.
 
+    HTML-escaped operators are accepted as aliases for the raw ones and reported
+    in the returned warnings - see _CLASSIFIER_OP_ALIASES for where the escaped
+    spelling comes from. Tolerance is needed here rather than at the caller
+    because the failure was silent: '&gt;' carries no reserved character, so
+    'is_greeting&gt;=0.5' parsed cleanly as an equality test on a key named
+    'is_greeting&gt;' and returned a confident zero. Negated, it was worse - an
+    exclusion on a key that exists nowhere fails open by design, so
+    '!is_greeting&gt;=0.5' returned the entire corpus.
+
     Returns:
-        Tuple of (list of filter dicts, error message or None)
+        Tuple of (list of filter dicts, error message or None, warnings)
         Each filter: {'key': str, 'op': str | None, 'value': Any, 'negate': bool}
     """
     if classifiers is None or not isinstance(classifiers, str):
-        return [], None
+        return [], None, []
 
     filters: List[dict] = []
+    warnings: List[str] = []
+    decoded_any = False
+    entity_keys: List[str] = []
 
     for part in classifiers.split(','):
         part = part.strip()
@@ -695,40 +819,67 @@ def parse_classifiers_filter(classifiers: str | None) -> tuple[List[dict], str |
                 "❌ Classifier filter '*' takes no operator or value. A threshold over "
                 "an arbitrary set of keys has no honest meaning - it would compare "
                 "unrelated scales against each other. Use '*' or '!*' alone, or name a key."
-            )
+            ), []
 
         key, op, value = part, None, None
-        for candidate in _CLASSIFIER_OPS:
-            idx = part.find(candidate)
-            if idx > 0:
-                key = part[:idx].strip()
-                op = candidate
-                value = _coerce_classifier_value(part[idx + len(candidate):])
-                break
+        found = _find_classifier_op(part)
+        if found is not None:
+            idx, surface, canonical = found
+            key = part[:idx].strip()
+            op = canonical
+            value = _coerce_classifier_value(part[idx + len(surface):])
+            if surface != canonical:
+                decoded_any = True
 
         if not key:
-            return [], f"❌ Classifier filter '{part}' has no key."
+            return [], f"❌ Classifier filter '{part}' has no key.", []
 
         for char in _CLASSIFIER_RESERVED:
             if char in key:
                 return [], (
                     f"❌ Classifier filter key '{key}' contains '{char}'. "
                     f"Expected key, !key, or key<op>value."
-                )
+                ), []
+
+        # An escaped spelling the alias table does not cover - a double escape,
+        # a numeric reference. It cannot be decoded without guessing, so the
+        # key is taken literally and the caller is told, because a literal key
+        # full of entities is the shape that used to answer zero in silence.
+        if _HTML_ENTITY_RE.search(key):
+            entity_keys.append(key)
 
         if op is not None and value is None:
             return [], (
                 f"❌ Classifier filter '{key}{op}' has no value. "
                 f"Use '{key}' alone to test that the key is present."
-            )
+            ), []
 
         if op in ('>', '>=', '<', '<=') and isinstance(value, bool):
-            return [], f"❌ Classifier filter '{key}{op}' needs a number, not a boolean."
+            return [], f"❌ Classifier filter '{key}{op}' needs a number, not a boolean.", []
 
         filters.append({'key': key, 'op': op, 'value': value,
                         'negate': negate, 'wildcard': False})
 
-    return filters, None
+    # Both warnings end on the raw form rather than the escaped one. The message
+    # has to quote the escaped spelling back to be any use, which puts another
+    # escaped example in the caller's context - so the last thing it reads is
+    # the spelling to copy.
+    if decoded_any:
+        warnings.append(
+            f"⚠️ Classifier filter used HTML-escaped operators. "
+            f"You sent: {classifiers.strip()} — I ran: {format_classifiers_filter(filters)} "
+            f"— spell operators raw next time: >= <= > < ="
+        )
+
+    for key in entity_keys:
+        warnings.append(
+            f"⚠️ Classifier filter key '{key}' contains an HTML character reference "
+            f"and was read as a literal key name, so it matches only a classifier "
+            f"actually stored under that name. If a comparison was meant, spell the "
+            f"operator raw: >= <= > <"
+        )
+
+    return filters, None, warnings
 
 
 def build_classifiers_sql(filters: List[dict], column: str = "classifiers") -> tuple[List[str], list]:
@@ -1113,7 +1264,7 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
     include_sources, exclude_sources = parse_source_with_exclusions(source)
     
     # V8: Parse classifier filters (exact match, ! prefix excludes and fails open)
-    classifier_filters, classifier_error = parse_classifiers_filter(classifiers)
+    classifier_filters, classifier_error, classifier_warnings = parse_classifiers_filter(classifiers)
     if classifier_error:
         total_time = time.time() - total_start
         response = add_timezone_to_response({"error": classifier_error})
@@ -1417,7 +1568,7 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
     
     # Add performance metrics and timezone
     total_time = time.time() - total_start
-    response = add_timezone_to_response(response)
+    response = add_timezone_to_response(response, classifier_warnings)
     return add_performance_to_response(response, embedding_time, db_time, total_time)
 
 def delete_memory(memory_id: int) -> dict:
@@ -2013,7 +2164,7 @@ def memory_stats(labels: str = None, source: str = None, classifiers: str = None
     include_sources, exclude_sources = parse_source_with_exclusions(source)
     
     # V8: Parse classifier filters (exact match, ! prefix excludes and fails open)
-    classifier_filters, classifier_error = parse_classifiers_filter(classifiers)
+    classifier_filters, classifier_error, classifier_warnings = parse_classifiers_filter(classifiers)
     if classifier_error:
         total_time = time.time() - total_start
         response = add_timezone_to_response({"error": classifier_error})
@@ -2047,7 +2198,7 @@ def memory_stats(labels: str = None, source: str = None, classifiers: str = None
             total_time = time.time() - total_start
             response = add_timezone_to_response({
                 "total_memories": total_count
-            })
+            }, classifier_warnings)
             return add_performance_to_response(response, embedding_time, db_time, total_time)
         
         # Build filter conditions
@@ -2159,7 +2310,7 @@ def memory_stats(labels: str = None, source: str = None, classifiers: str = None
         db_time = time.time() - db_start
         total_time = time.time() - total_start
         
-        response = add_timezone_to_response(response)
+        response = add_timezone_to_response(response, classifier_warnings)
         return add_performance_to_response(response, embedding_time, db_time, total_time)
     
     except Exception as e:
@@ -2167,7 +2318,7 @@ def memory_stats(labels: str = None, source: str = None, classifiers: str = None
         total_time = time.time() - total_start
         response = add_timezone_to_response({
             "error": f"❌ Error getting memory stats: {str(e)}"
-        })
+        }, classifier_warnings)
         return add_performance_to_response(response, embedding_time, db_time, total_time)
     finally:
         cur.close()
