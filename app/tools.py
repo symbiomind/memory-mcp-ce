@@ -739,6 +739,25 @@ def normalize_classifiers(classifiers_value: Any) -> tuple[Dict[str, Any], str |
                     f"❌ Classifier key '{key}' cannot contain '{char}'. "
                     f"Reserved for filter syntax: {' '.join(_CLASSIFIER_RESERVED)}"
                 )
+        # The same rule, applied to the escaped spelling of a reserved
+        # character. Without this, 'is_task>=0.7' is rejected for the '>' in its
+        # key while 'is_task&gt;=0.7' is stored as a key named 'is_task&gt;' -
+        # the grammar forbidding a character and accepting its escape. That is
+        # not a judgement about what the caller meant, which this server never
+        # makes about classifiers: it is the existing key rule being consistent
+        # across spellings. A key whose escapes decode to nothing reserved is
+        # left exactly as given, because the map is the caller's.
+        decoded_key = html.unescape(key)
+        if decoded_key != key:
+            for char in _CLASSIFIER_RESERVED:
+                if char in decoded_key:
+                    return {}, (
+                        f"❌ Classifier key '{key}' is an HTML-escaped "
+                        f"'{decoded_key}', and '{char}' is reserved for filter "
+                        f"syntax: {' '.join(_CLASSIFIER_RESERVED)}. Classifiers are "
+                        f"stored as key=value only - there are no comparison "
+                        f"operators on this side, so nothing here needs escaping."
+                    )
         if isinstance(value, bool) or value is None or isinstance(value, str):
             cleaned[key] = value
         elif isinstance(value, (int, float)):
