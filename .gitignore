@@ -1,6 +1,7 @@
 # Project Directories
 data/
 notes/
+.claude/
 
 # Python
 __pycache__/
@@ -21,6 +22,7 @@ __pycache__/
 *.swp
 *.swo
 .clinerules/
+CLAUDE.md
 
 # Docker
 *.log
