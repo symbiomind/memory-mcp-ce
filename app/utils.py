@@ -119,8 +119,9 @@ def update_label_token_popularity(namespace: str, labels: list[str], conn) -> No
         cur = conn.cursor()
         
         # Batch upsert using unnest() - single query for all tokens
-        tokens = list(token_counts.keys())
-        counts = list(token_counts.values())
+        # Sorted so concurrent upserts lock rows in the same order and cannot deadlock
+        tokens = sorted(token_counts)
+        counts = [token_counts[t] for t in tokens]
         namespaces = [namespace] * len(tokens)
         
         cur.execute("""

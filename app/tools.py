@@ -90,21 +90,15 @@ def update_related_backlinks(new_memory_id: int, new_content_id: int, new_labels
         return
     
     try:
-        for rel in related_memories:
+        # One statement per row, appending in the database: a read-modify-write
+        # from Python would overwrite the whole state object and drop a
+        # concurrent store's backlink (or anything else written to state).
+        # Rows are touched in id order so two stores sharing related memories
+        # lock them in the same order and cannot deadlock.
+        for rel in sorted(related_memories, key=lambda r: r.get('id') or 0):
             related_id = rel.get('id')
             if not related_id:
                 continue
-            
-            # Fetch the related memory's current state
-            cur.execute(
-                "SELECT state FROM memories WHERE id = %s AND namespace = %s",
-                (related_id, namespace)
-            )
-            row = cur.fetchone()
-            if not row:
-                continue
-            
-            current_state = row[0] if row[0] else {}
             
             # Build backlink entry - only id and similarity, source looked up at display time
             backlink = {
@@ -112,23 +106,23 @@ def update_related_backlinks(new_memory_id: int, new_content_id: int, new_labels
                 "similarity": rel.get('similarity', 0)
             }
             
-            # Get existing related array or create new one
-            existing_related = current_state.get('related', [])
-            
-            # Check if backlink already exists (shouldn't, but be safe)
-            if not any(r.get('id') == new_memory_id for r in existing_related):
-                existing_related.append(backlink)
-                
-                # Keep only top entries to prevent explosion (optional: could limit to 10)
-                # For now, let it grow - old memories accumulate connections
-                
-                current_state['related'] = existing_related
-                
-                # Update the related memory's state
-                cur.execute(
-                    "UPDATE memories SET state = %s WHERE id = %s",
-                    (psycopg2.extras.Json(current_state), related_id)
+            # Append unless the backlink already exists (shouldn't, but be safe).
+            # For now, let it grow - old memories accumulate connections
+            cur.execute("""
+                UPDATE memories
+                SET state = jsonb_set(
+                    COALESCE(state, '{}'::jsonb),
+                    '{related}',
+                    COALESCE(state->'related', '[]'::jsonb) || %s::jsonb
                 )
+                WHERE id = %s AND namespace = %s
+                AND NOT COALESCE(state->'related', '[]'::jsonb) @> %s::jsonb
+            """, (
+                json.dumps([backlink]),
+                related_id,
+                namespace,
+                json.dumps([{"id": new_memory_id}])
+            ))
         
         conn.commit()
         logger.debug(f"🔗 Added backlinks to {len(related_memories)} related memories")
@@ -156,37 +150,22 @@ def cleanup_related_on_delete(memory_id: int, namespace: str, cur, conn) -> None
         conn: Database connection
     """
     try:
-        # Find all memories that reference this memory in their related array
+        # Filter the entry out in the database: rewriting state from a Python
+        # copy would drop anything a concurrent writer added in between.
         # JSONB containment query: state->'related' contains an object with this id
         cur.execute("""
-            SELECT id, state FROM memories 
+            UPDATE memories
+            SET state = jsonb_set(state, '{related}', COALESCE(
+                (SELECT jsonb_agg(r ORDER BY ord)
+                 FROM jsonb_array_elements(state->'related') WITH ORDINALITY AS e(r, ord)
+                 WHERE NOT r @> jsonb_build_object('id', %s::bigint)),
+                '[]'::jsonb
+            ))
             WHERE namespace = %s 
             AND state->'related' @> %s::jsonb
-        """, (namespace, json.dumps([{"id": memory_id}])))
+        """, (memory_id, namespace, json.dumps([{"id": memory_id}])))
         
-        referencing_memories = cur.fetchall()
-        
-        if not referencing_memories:
-            return
-        
-        for ref_id, ref_state in referencing_memories:
-            if not ref_state:
-                continue
-                
-            existing_related = ref_state.get('related', [])
-            
-            # Remove the entry for the deleted memory
-            new_related = [r for r in existing_related if r.get('id') != memory_id]
-            
-            ref_state['related'] = new_related
-            
-            # Update the memory's state
-            cur.execute(
-                "UPDATE memories SET state = %s WHERE id = %s",
-                (psycopg2.extras.Json(ref_state), ref_id)
-            )
-        
-        logger.debug(f"🧹 Cleaned up related references from {len(referencing_memories)} memories")
+        logger.debug(f"🧹 Cleaned up related references from {cur.rowcount} memories")
         
     except Exception as e:
         # Log warning but don't fail the delete operation
@@ -2160,10 +2139,13 @@ def add_labels(memory_id: int, labels: str) -> dict:
     try:
         # Fetch existing memory from memories table (source of truth)
         # Note: resolve_memory_id already verified namespace access for namespaced mode
+        # FOR UPDATE: the labels are rewritten from this read, so hold the row
+        # until commit or a concurrent edit is silently lost
         select_sql = """
             SELECT id, labels
             FROM memories
-            WHERE id = %s;
+            WHERE id = %s
+            FOR UPDATE;
         """
         cur.execute(select_sql, (memory_id,))
         
@@ -2639,10 +2621,13 @@ def del_labels(memory_id: int, labels: str) -> dict:
     try:
         # Fetch existing memory from memories table (source of truth)
         # Note: resolve_memory_id already verified namespace access for namespaced mode
+        # FOR UPDATE: the labels are rewritten from this read, so hold the row
+        # until commit or a concurrent edit is silently lost
         select_sql = """
             SELECT id, labels
             FROM memories
-            WHERE id = %s;
+            WHERE id = %s
+            FOR UPDATE;
         """
         cur.execute(select_sql, (memory_id,))
         
@@ -2795,10 +2780,13 @@ def replace_labels(memory_id: int, target: str, new: str) -> dict:
     
     try:
         # Fetch existing memory from memories table (source of truth)
+        # FOR UPDATE: the labels are rewritten from this read, so hold the row
+        # until commit or a concurrent edit is silently lost
         select_sql = """
             SELECT id, labels
             FROM memories
-            WHERE id = %s;
+            WHERE id = %s
+            FOR UPDATE;
         """
         cur.execute(select_sql, (memory_id,))
         
@@ -2944,7 +2932,8 @@ def set_classifiers(memory_id: int, classifiers: str, merge: bool = True) -> dic
     cur = conn.cursor()
 
     try:
-        cur.execute("SELECT classifiers FROM memories WHERE id = %s;", (memory_id,))
+        # FOR UPDATE: the map is rewritten from this read (see the label tools)
+        cur.execute("SELECT classifiers FROM memories WHERE id = %s FOR UPDATE;", (memory_id,))
         row = cur.fetchone()
         if row is None:
             db_time = time.time() - db_start
@@ -3049,7 +3038,8 @@ def del_classifiers(memory_id: int, keys: str) -> dict:
     cur = conn.cursor()
 
     try:
-        cur.execute("SELECT classifiers FROM memories WHERE id = %s;", (memory_id,))
+        # FOR UPDATE: the map is rewritten from this read (see the label tools)
+        cur.execute("SELECT classifiers FROM memories WHERE id = %s FOR UPDATE;", (memory_id,))
         row = cur.fetchone()
         if row is None:
             db_time = time.time() - db_start
