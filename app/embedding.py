@@ -1,6 +1,6 @@
 
 from openai import OpenAI
-from app.config import EMBEDDING_URL, EMBEDDING_MODEL, EMBEDDING_API_KEY, EMBEDDING_DIMS
+from app.config import EMBEDDING_URL, EMBEDDING_MODEL, EMBEDDING_API_KEY, EMBEDDING_DIMS, EMBEDDING_TIMEOUT
 
 # Module-level cache for embedding dimension validation
 # Prevents redundant API calls on every retrieve_memories query
@@ -10,6 +10,7 @@ _validated_embedding_dims = None
 client = OpenAI(
     base_url=EMBEDDING_URL,
     api_key=EMBEDDING_API_KEY or "dummy-key", # a dummy key is required for the client to work
+    timeout=EMBEDDING_TIMEOUT,
     #default_headers={
     #    "HTTP-Referer": "https://your-mcp-ce-saas.com",  # Your site URL
     #    "X-Title": "MCP-CE Memory Platform",  # Your site name

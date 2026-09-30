@@ -11,6 +11,8 @@ Based on MCP Python SDK v1.24.0 patterns.
 
 import logging
 import functools
+
+import anyio
 from typing import Any
 
 from pydantic import AnyHttpUrl, ValidationError
@@ -352,7 +354,14 @@ def register_api_routes(mcp: FastMCP) -> None:
 
 
 def register_tools(mcp: FastMCP) -> None:
-    """Register all MCP tools with validation error handling."""
+    """
+    Register all MCP tools with validation error handling.
+
+    The tools do blocking I/O (psycopg2, the sync embedding client), so each
+    call runs in a worker thread. Calling them directly would block the one
+    event loop and stall every other client, /login and /api/* until it
+    returned. Each call opens its own DB connection, so threads share nothing.
+    """
     
     @mcp.tool(
         annotations={
@@ -384,7 +393,7 @@ def register_tools(mcp: FastMCP) -> None:
         Returns:
             Result with success status and memory ID
         """
-        return tools.store_memory(content, labels, source, classifiers)
+        return await anyio.to_thread.run_sync(tools.store_memory, content, labels, source, classifiers)
     
     @mcp.tool(
         annotations={
@@ -425,7 +434,7 @@ def register_tools(mcp: FastMCP) -> None:
         Returns:
             List of matching memories (with similarity scores if query provided)
         """
-        return tools.retrieve_memories(query, labels, source, classifiers, num_results)
+        return await anyio.to_thread.run_sync(tools.retrieve_memories, query, labels, source, classifiers, num_results)
     
     @mcp.tool(
         annotations={
@@ -451,7 +460,7 @@ def register_tools(mcp: FastMCP) -> None:
         Returns:
             Result with success status and updated labels
         """
-        return tools.add_labels(memory_id, labels)
+        return await anyio.to_thread.run_sync(tools.add_labels, memory_id, labels)
     
     @mcp.tool(
         annotations={
@@ -477,7 +486,7 @@ def register_tools(mcp: FastMCP) -> None:
         Returns:
             Result with success status and updated labels
         """
-        return tools.del_labels(memory_id, labels)
+        return await anyio.to_thread.run_sync(tools.del_labels, memory_id, labels)
     
     @mcp.tool(
         annotations={
@@ -508,7 +517,7 @@ def register_tools(mcp: FastMCP) -> None:
         Returns:
             Result with success status and updated labels
         """
-        return tools.replace_labels(memory_id, target, new)
+        return await anyio.to_thread.run_sync(tools.replace_labels, memory_id, target, new)
     
     @mcp.tool(
         annotations={
@@ -543,7 +552,7 @@ def register_tools(mcp: FastMCP) -> None:
         Returns:
             Result with success status and the resulting classifiers
         """
-        return tools.set_classifiers(memory_id, classifiers, merge)
+        return await anyio.to_thread.run_sync(tools.set_classifiers, memory_id, classifiers, merge)
     
     @mcp.tool(
         annotations={
@@ -572,7 +581,7 @@ def register_tools(mcp: FastMCP) -> None:
         Returns:
             Result with success status and the remaining classifiers
         """
-        return tools.del_classifiers(memory_id, keys)
+        return await anyio.to_thread.run_sync(tools.del_classifiers, memory_id, keys)
     
     @mcp.tool(
         annotations={
@@ -596,7 +605,7 @@ def register_tools(mcp: FastMCP) -> None:
         Returns:
             Result with success status
         """
-        return tools.delete_memory(memory_id)
+        return await anyio.to_thread.run_sync(tools.delete_memory, memory_id)
     
     @mcp.tool(
         annotations={
@@ -618,7 +627,7 @@ def register_tools(mcp: FastMCP) -> None:
         Returns:
             The full memory object with all metadata
         """
-        return tools.get_memory(memory_id)
+        return await anyio.to_thread.run_sync(tools.get_memory, memory_id)
     
     @mcp.tool(
         annotations={
@@ -642,7 +651,7 @@ def register_tools(mcp: FastMCP) -> None:
         Returns:
             A random memory matching the filters
         """
-        return tools.random_memory(labels, source)
+        return await anyio.to_thread.run_sync(tools.random_memory, labels, source)
     
     @mcp.tool(
         annotations={
@@ -675,7 +684,7 @@ def register_tools(mcp: FastMCP) -> None:
             Statistics including total count, matching count, percentage,
             and list of matched labels/sources (labels_matched, sources_matched)
         """
-        return tools.memory_stats(labels, source, classifiers)
+        return await anyio.to_thread.run_sync(tools.memory_stats, labels, source, classifiers)
     
     @mcp.tool(
         annotations={
@@ -706,7 +715,7 @@ def register_tools(mcp: FastMCP) -> None:
         Returns:
             List of trending labels with counts and the top matching token
         """
-        return tools.trending_labels(days, limit)
+        return await anyio.to_thread.run_sync(tools.trending_labels, days, limit)
     
     # Keep in sync with the tools registered above; the count is derived so it
     # cannot drift from the list the way a hardcoded total does.

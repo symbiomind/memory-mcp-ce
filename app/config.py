@@ -28,6 +28,11 @@ EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY")
 _embedding_dims_raw = os.getenv("EMBEDDING_DIMS", "").strip()
 EMBEDDING_DIMS = int(_embedding_dims_raw) if _embedding_dims_raw else None
 
+# Seconds to wait for one embedding request before giving up (per attempt;
+# the client retries twice). Without it the OpenAI SDK waits up to 600s, and
+# a hung embedder holds the calling tool that long.
+EMBEDDING_TIMEOUT = float(os.getenv("EMBEDDING_TIMEOUT", "").strip() or 30)
+
 # MCP Configuration
 BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 NAMESPACE = os.getenv("NAMESPACE")
