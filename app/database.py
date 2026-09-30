@@ -197,7 +197,7 @@ def create_system_state_table() -> None:
 
 
 def create_memories_table() -> None:
-    """Create the main memories table (source of truth) with V8 schema."""
+    """Create the main memories table (source of truth) with V9 schema."""
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -238,8 +238,9 @@ def create_memories_table() -> None:
         """)
         
         # V6: Index for efficient MAX(content_id) queries per namespace
+        # V9: UNIQUE - content_id is the user-facing memory number
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_memories_namespace_content_id 
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_namespace_content_id 
             ON memories(namespace, content_id DESC);
         """)
         
@@ -250,7 +251,7 @@ def create_memories_table() -> None:
         """)
         
         conn.commit()
-        logger.info("✅ Created memories table with indexes (V8 schema)")
+        logger.info("✅ Created memories table with indexes (V9 schema)")
     finally:
         cur.close()
         conn.close()

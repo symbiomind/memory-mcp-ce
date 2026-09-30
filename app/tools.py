@@ -21,6 +21,10 @@ from datetime import datetime, timezone
 # Get logger
 logger = logging.getLogger(__name__)
 
+# Advisory lock class for content_id minting, paired with hashtext(namespace).
+# The two-key form keeps it out of the migration lock's single-key space.
+CONTENT_ID_LOCK_CLASS = 9
+
 
 # =============================================================================
 # Related Memories Helper Functions
@@ -1194,6 +1198,12 @@ def store_memory(content: str, labels: str = None, source: str = None,
         is_encrypted = False
     
     # V6: Get next content_id for this namespace (namespace-scoped sequential numbering)
+    # V9: Serialise minting per namespace. The lock is held until commit, so the
+    # next store's MAX sees this row. The unique index is the backstop.
+    cur.execute(
+        """SELECT pg_advisory_xact_lock(%s, hashtext(%s));""",
+        (CONTENT_ID_LOCK_CLASS, namespace)
+    )
     cur.execute(
         """SELECT COALESCE(MAX(content_id), 0) + 1 FROM memories WHERE namespace = %s;""",
         (namespace,)

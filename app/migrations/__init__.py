@@ -1,7 +1,7 @@
 """
 Memory MCP-CE Migrations Module
 
-Provides database schema migrations from V1 through V8.
+Provides database schema migrations from V1 through V9.
 """
 
 from app.migrations.runner import CURRENT_DB_VERSION, run_migrations
