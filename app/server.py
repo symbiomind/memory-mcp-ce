@@ -312,7 +312,8 @@ def register_api_routes(mcp: FastMCP) -> None:
         
         # Process request
         try:
-            result = await generate_embeddings_handler(body)
+            # Sync setup (dimension probe, table creation, force delete) - keep it off the event loop
+            result = await anyio.to_thread.run_sync(generate_embeddings_handler, body)
             return JSONResponse(content=result, status_code=202)
         except ValueError as e:
             raise HTTPException(400, str(e))
@@ -338,7 +339,8 @@ def register_api_routes(mcp: FastMCP) -> None:
         
         # Process request
         try:
-            result = await delete_embeddings_handler(body)
+            # Sync setup (dimension probe, table creation, force delete) - keep it off the event loop
+            result = await anyio.to_thread.run_sync(delete_embeddings_handler, body)
             return JSONResponse(content=result, status_code=202)
         except ValueError as e:
             raise HTTPException(400, str(e))

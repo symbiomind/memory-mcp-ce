@@ -17,7 +17,7 @@ from typing import Optional
 from openai import OpenAI
 import psycopg2.extras
 
-from app.config import NAMESPACE
+from app.config import NAMESPACE, EMBEDDING_TIMEOUT
 from app.database import (
     get_db_connection,
     get_existing_embedding_tables,
@@ -144,6 +144,7 @@ def _do_reembedding(
     client = OpenAI(
         base_url=embedding_url,
         api_key=embedding_api_key or "not-needed",
+        timeout=EMBEDDING_TIMEOUT,
     )
     
     conn = get_db_connection()
@@ -318,7 +319,7 @@ def _do_delete_embeddings(
         conn.close()
 
 
-async def delete_embeddings_handler(request_body: dict) -> dict:
+def delete_embeddings_handler(request_body: dict) -> dict:
     """
     Handle DELETE /api/embeddings/delete request.
     
@@ -369,7 +370,7 @@ async def delete_embeddings_handler(request_body: dict) -> dict:
     }
 
 
-async def generate_embeddings_handler(request_body: dict) -> dict:
+def generate_embeddings_handler(request_body: dict) -> dict:
     """
     Handle POST /api/embeddings/generate request.
     
@@ -439,6 +440,7 @@ async def generate_embeddings_handler(request_body: dict) -> dict:
     client = OpenAI(
         base_url=embedding_url,
         api_key=embedding_api_key or "not-needed",
+        timeout=EMBEDDING_TIMEOUT,
     )
     
     # Detect/validate embedding dimensions
