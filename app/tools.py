@@ -979,6 +979,77 @@ def build_classifiers_sql(filters: List[dict], column: str = "classifiers") -> t
     return clauses, params
 
 
+def like_pattern(value: str) -> str:
+    """
+    Wrap a value for substring ILIKE matching, escaping its own wildcards.
+
+    Labels and sources match fuzzily on purpose - "claude" finds
+    "anthropic/claude-sonnet" - but only through the % wrapped around the
+    value. A '_' or '%' inside the value is literal: "openrouter_default"
+    must not match "openrouterXdefault". Pair with ESCAPE '\\' in the SQL.
+    """
+    escaped = value.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+    return f"%{escaped}%"
+
+
+def build_filter_sql(
+    include_labels: List[str],
+    exclude_labels: List[str],
+    include_sources: List[str],
+    exclude_sources: List[str],
+    classifier_filters: List[dict] | None = None,
+    alias: str = "",
+) -> tuple[List[str], list]:
+    """
+    Build WHERE clauses and params for the label, source and classifier
+    filters shared by every read path.
+
+    - Include labels / sources: fuzzy, OR-combined within each kind
+    - Exclude labels / sources: fuzzy, each one a separate AND NOT
+    - Classifiers: exact, see build_classifiers_sql
+
+    A source exclusion passes rows with no source, the same way a negated
+    classifier filter passes unclassified rows. A bare NOT ILIKE would be
+    NULL there and silently drop them.
+
+    alias qualifies the columns ("m" for the semantic path's join).
+    """
+    col = f"{alias}." if alias else ""
+    clauses: List[str] = []
+    params: list = []
+
+    label_match = (
+        f"EXISTS (SELECT 1 FROM jsonb_array_elements_text({col}labels) AS label "
+        f"WHERE label ILIKE %s ESCAPE '\\')"
+    )
+
+    if include_labels:
+        clauses.append(f"({' OR '.join([label_match] * len(include_labels))})")
+        params.extend(like_pattern(label) for label in include_labels)
+
+    for label in exclude_labels:
+        clauses.append(f"NOT {label_match}")
+        params.append(like_pattern(label))
+
+    if include_sources:
+        source_match = f"{col}source ILIKE %s ESCAPE '\\'"
+        clauses.append(f"({' OR '.join([source_match] * len(include_sources))})")
+        params.extend(like_pattern(src) for src in include_sources)
+
+    for src in exclude_sources:
+        clauses.append(f"({col}source IS NULL OR {col}source NOT ILIKE %s ESCAPE '\\')")
+        params.append(like_pattern(src))
+
+    if classifier_filters:
+        cls_clauses, cls_params = build_classifiers_sql(
+            classifier_filters, f"{col}classifiers"
+        )
+        clauses.extend(cls_clauses)
+        params.extend(cls_params)
+
+    return clauses, params
+
+
 def extract_json_params(param_value: str, required_key: str) -> tuple[str, str | None, str | None, List[str]]:
     """
     Extract content, labels, and source from JSON-embedded parameter (Grok workaround).
@@ -1394,39 +1465,13 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
         if not encryption_available:
             where_clauses.append("m.enc = false")
         
-        # Label filtering on memories table with fuzzy matching (include/exclude)
-        # Include labels: fuzzy OR match
-        if include_labels:
-            include_conditions = []
-            for label in include_labels:
-                include_conditions.append(f"EXISTS (SELECT 1 FROM jsonb_array_elements_text(m.labels) AS label WHERE label ILIKE %s)")
-                params.append(f"%{label}%")
-            where_clauses.append(f"({' OR '.join(include_conditions)})")
-        
-        # Exclude labels: fuzzy AND NOT match (each exclusion is separate)
-        for label in exclude_labels:
-            where_clauses.append(f"NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(m.labels) AS label WHERE label ILIKE %s)")
-            params.append(f"%{label}%")
-        
-        # Source filtering on memories table with fuzzy matching (include/exclude)
-        # Include sources: fuzzy OR match
-        if include_sources:
-            include_conditions = []
-            for src in include_sources:
-                include_conditions.append("m.source ILIKE %s")
-                params.append(f"%{src}%")
-            where_clauses.append(f"({' OR '.join(include_conditions)})")
-        
-        # Exclude sources: fuzzy AND NOT match (each exclusion is separate)
-        for src in exclude_sources:
-            where_clauses.append("NOT m.source ILIKE %s")
-            params.append(f"%{src}%")
-        
-        # V8: Classifier filtering (exact match, AND-combined)
-        if classifier_filters:
-            cls_clauses, cls_params = build_classifiers_sql(classifier_filters, "m.classifiers")
-            where_clauses.extend(cls_clauses)
-            params.extend(cls_params)
+        # Label, source and classifier filters (fuzzy labels/sources, exact classifiers)
+        filter_clauses, filter_params = build_filter_sql(
+            include_labels, exclude_labels, include_sources, exclude_sources,
+            classifier_filters, alias="m"
+        )
+        where_clauses.extend(filter_clauses)
+        params.extend(filter_params)
         
         if where_clauses:
             sql += " WHERE " + " AND ".join(where_clauses)
@@ -1512,39 +1557,13 @@ def retrieve_memories(query: str = None, labels: str = None, source: str = None,
         if not encryption_available:
             where_clauses.append("enc = false")
         
-        # Label filtering with fuzzy matching (include/exclude)
-        # Include labels: fuzzy OR match
-        if include_labels:
-            include_conditions = []
-            for label in include_labels:
-                include_conditions.append(f"EXISTS (SELECT 1 FROM jsonb_array_elements_text(labels) AS label WHERE label ILIKE %s)")
-                params.append(f"%{label}%")
-            where_clauses.append(f"({' OR '.join(include_conditions)})")
-        
-        # Exclude labels: fuzzy AND NOT match (each exclusion is separate)
-        for label in exclude_labels:
-            where_clauses.append(f"NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(labels) AS label WHERE label ILIKE %s)")
-            params.append(f"%{label}%")
-        
-        # Source filtering with fuzzy matching (include/exclude)
-        # Include sources: fuzzy OR match
-        if include_sources:
-            include_conditions = []
-            for src in include_sources:
-                include_conditions.append("source ILIKE %s")
-                params.append(f"%{src}%")
-            where_clauses.append(f"({' OR '.join(include_conditions)})")
-        
-        # Exclude sources: fuzzy AND NOT match (each exclusion is separate)
-        for src in exclude_sources:
-            where_clauses.append("NOT source ILIKE %s")
-            params.append(f"%{src}%")
-        
-        # V8: Classifier filtering (exact match, AND-combined)
-        if classifier_filters:
-            cls_clauses, cls_params = build_classifiers_sql(classifier_filters, "classifiers")
-            where_clauses.extend(cls_clauses)
-            params.extend(cls_params)
+        # Label, source and classifier filters (fuzzy labels/sources, exact classifiers)
+        filter_clauses, filter_params = build_filter_sql(
+            include_labels, exclude_labels, include_sources, exclude_sources,
+            classifier_filters
+        )
+        where_clauses.extend(filter_clauses)
+        params.extend(filter_params)
         
         if where_clauses:
             sql += " WHERE " + " AND ".join(where_clauses)
@@ -1970,33 +1989,12 @@ def random_memory(labels: str = None, source: str = None) -> dict:
         if not encryption_available:
             where_clauses.append("enc = false")
         
-        # Label filtering with fuzzy matching (include/exclude)
-        # Include labels: fuzzy OR match
-        if include_labels:
-            include_conditions = []
-            for label in include_labels:
-                include_conditions.append(f"EXISTS (SELECT 1 FROM jsonb_array_elements_text(labels) AS label WHERE label ILIKE %s)")
-                params.append(f"%{label}%")
-            where_clauses.append(f"({' OR '.join(include_conditions)})")
-        
-        # Exclude labels: fuzzy AND NOT match (each exclusion is separate)
-        for label in exclude_labels:
-            where_clauses.append(f"NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(labels) AS label WHERE label ILIKE %s)")
-            params.append(f"%{label}%")
-        
-        # Source filtering with fuzzy matching (include/exclude)
-        # Include sources: fuzzy OR match
-        if include_sources:
-            include_conditions = []
-            for src in include_sources:
-                include_conditions.append("source ILIKE %s")
-                params.append(f"%{src}%")
-            where_clauses.append(f"({' OR '.join(include_conditions)})")
-        
-        # Exclude sources: fuzzy AND NOT match (each exclusion is separate)
-        for src in exclude_sources:
-            where_clauses.append("NOT source ILIKE %s")
-            params.append(f"%{src}%")
+        # Label and source filters (fuzzy)
+        filter_clauses, filter_params = build_filter_sql(
+            include_labels, exclude_labels, include_sources, exclude_sources
+        )
+        where_clauses.extend(filter_clauses)
+        params.extend(filter_params)
         
         if where_clauses:
             sql += " WHERE " + " AND ".join(where_clauses)
@@ -2278,43 +2276,13 @@ def memory_stats(labels: str = None, source: str = None, classifiers: str = None
         filter_where = base_where.copy()
         filter_params = base_params.copy()
         
-        # Label filtering with fuzzy matching (include/exclude)
-        # Include labels: fuzzy OR match
-        if include_labels:
-            include_conditions = []
-            for label in include_labels:
-                include_conditions.append(
-                    f"EXISTS (SELECT 1 FROM jsonb_array_elements_text(labels) AS label WHERE label ILIKE %s)"
-                )
-                filter_params.append(f"%{label}%")
-            filter_where.append(f"({' OR '.join(include_conditions)})")
-        
-        # Exclude labels: fuzzy AND NOT match (each exclusion is separate)
-        for label in exclude_labels:
-            filter_where.append(
-                f"NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(labels) AS label WHERE label ILIKE %s)"
-            )
-            filter_params.append(f"%{label}%")
-        
-        # Source filtering with fuzzy matching (include/exclude)
-        # Include sources: fuzzy OR match
-        if include_sources:
-            include_conditions = []
-            for src in include_sources:
-                include_conditions.append("source ILIKE %s")
-                filter_params.append(f"%{src}%")
-            filter_where.append(f"({' OR '.join(include_conditions)})")
-        
-        # Exclude sources: fuzzy AND NOT match (each exclusion is separate)
-        for src in exclude_sources:
-            filter_where.append("NOT source ILIKE %s")
-            filter_params.append(f"%{src}%")
-        
-        # V8: Classifier filtering (exact match, AND-combined)
-        if classifier_filters:
-            cls_clauses, cls_params = build_classifiers_sql(classifier_filters, "classifiers")
-            filter_where.extend(cls_clauses)
-            filter_params.extend(cls_params)
+        # Label, source and classifier filters (fuzzy labels/sources, exact classifiers)
+        filter_clauses, filter_clause_params = build_filter_sql(
+            include_labels, exclude_labels, include_sources, exclude_sources,
+            classifier_filters
+        )
+        filter_where.extend(filter_clauses)
+        filter_params.extend(filter_clause_params)
         
         filter_where_sql = " WHERE " + " AND ".join(filter_where) if filter_where else ""
         
@@ -2345,8 +2313,8 @@ def memory_stats(labels: str = None, source: str = None, classifiers: str = None
             label_match_params = base_params.copy()
             
             for label in include_labels:
-                label_match_conditions.append("lbl ILIKE %s")
-                label_match_params.append(f"%{label}%")
+                label_match_conditions.append("lbl ILIKE %s ESCAPE '\\'")
+                label_match_params.append(like_pattern(label))
             
             labels_sql = f"""
                 SELECT DISTINCT lbl
@@ -2366,8 +2334,8 @@ def memory_stats(labels: str = None, source: str = None, classifiers: str = None
             source_match_params = base_params.copy()
             
             for src in include_sources:
-                source_match_conditions.append("source ILIKE %s")
-                source_match_params.append(f"%{src}%")
+                source_match_conditions.append("source ILIKE %s ESCAPE '\\'")
+                source_match_params.append(like_pattern(src))
             
             sources_sql = f"""
                 SELECT DISTINCT source
@@ -2467,9 +2435,9 @@ def trending_labels(days: int = 30, limit: int = 10) -> dict:
         
         for token in tokens:
             label_conditions.append(
-                "EXISTS (SELECT 1 FROM jsonb_array_elements_text(labels) AS lbl WHERE lbl ILIKE %s)"
+                "EXISTS (SELECT 1 FROM jsonb_array_elements_text(labels) AS lbl WHERE lbl ILIKE %s ESCAPE '\\')"
             )
-            label_params.append(f"%{token}%")
+            label_params.append(like_pattern(token))
         
         # Add time window filter (same days parameter)
         stage2_sql = f"""
