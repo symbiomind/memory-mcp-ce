@@ -149,6 +149,9 @@ def cleanup_related_on_delete(memory_id: int, namespace: str, cur, conn) -> None
         cur: Database cursor
         conn: Database connection
     """
+    # Savepoint so a failure here rolls back only the cleanup, not the
+    # caller's delete
+    cur.execute("SAVEPOINT cleanup_related;")
     try:
         # Filter the entry out in the database: rewriting state from a Python
         # copy would drop anything a concurrent writer added in between.
@@ -165,10 +168,13 @@ def cleanup_related_on_delete(memory_id: int, namespace: str, cur, conn) -> None
             AND state->'related' @> %s::jsonb
         """, (memory_id, namespace, json.dumps([{"id": memory_id}])))
         
-        logger.debug(f"🧹 Cleaned up related references from {cur.rowcount} memories")
+        cleaned = cur.rowcount
+        cur.execute("RELEASE SAVEPOINT cleanup_related;")
+        logger.debug(f"🧹 Cleaned up related references from {cleaned} memories")
         
     except Exception as e:
         # Log warning but don't fail the delete operation
+        cur.execute("ROLLBACK TO SAVEPOINT cleanup_related;")
         logger.warning(f"⚠️ Failed to cleanup related references: {e}")
 
 
@@ -1740,12 +1746,18 @@ def delete_memory(memory_id: int) -> dict:
             table_names = []
         
         # Delete from all tracked embedding tables (handles cross-dimensional cleanup)
+        # Each attempt runs under a savepoint: a failed statement aborts the
+        # whole transaction in PostgreSQL, so without one a missing table
+        # would fail the delete itself.
         for table_name in table_names:
+            cur.execute("SAVEPOINT drop_embedding;")
             try:
                 cur.execute(f"DELETE FROM {table_name} WHERE memory_id = %s;", (memory_id,))
+                cur.execute("RELEASE SAVEPOINT drop_embedding;")
                 logger.debug(f"Deleted embeddings from {table_name} for memory #{memory_id}")
             except Exception as e:
                 # Table might not exist anymore - that's OK
+                cur.execute("ROLLBACK TO SAVEPOINT drop_embedding;")
                 logger.debug(f"Could not delete from {table_name}: {e}")
         
         # V8: Cleanup related references - remove this memory from other memories' related arrays
